@@ -1,0 +1,7 @@
+node_modules/
+.env
+rtk3-captures/
+*.pcap
+*.pcapng
+*.tar.gz
+npm-debug.log*
