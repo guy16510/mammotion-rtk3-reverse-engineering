@@ -1,5 +1,18 @@
-node_modules/
+.pio/
+.vscode/
+include/secrets.h
+*.bin
+*.elf
+*.map
+.DS_Store
+
+# Local environment and credential files
 .env
+.env.*
+!.env.example
+
+# Legacy host-capture artifacts
+node_modules/
 rtk3-captures/
 *.pcap
 *.pcapng
