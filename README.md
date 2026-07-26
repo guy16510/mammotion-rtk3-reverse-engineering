@@ -1,95 +1,70 @@
-# Mammotion RTK3 ESP32-S3 probe
+# Mammotion RTK3 ESP32-S3 network probe
 
-Standalone ESP32-S3 firmware for passively investigating a Mammotion RTK3. No Raspberry Pi, Linux service, Node.js process, USB UART adapter, or always-on computer is required after the board is flashed.
+Standalone ESP32-S3 firmware for finding and probing a Mammotion RTK3 that is already connected to your home Wi-Fi.
 
-Your Mac is only used to build, flash, monitor, and download captures.
+No Raspberry Pi, always-on Mac, UART wiring, USB serial adapter, Node.js service, or manually entered RTK IP is required after the ESP32-S3 is flashed.
 
 ## What it does
 
-- Cycles through common GNSS UART baud rates
-- Captures raw receive-only UART data to ESP32 flash
-- Validates RTCM3 frames with CRC-24Q
-- Detects RTCM message types, u-blox UBX sync markers, and NMEA prefixes
-- Scans nearby Wi-Fi networks
-- Scans BLE advertisements without connecting
-- Runs a bounded TCP connect check against private IPv4 targets only
-- Exposes a local browser interface and JSON endpoints
-- Keeps working from its own Wi-Fi access point when home Wi-Fi is unavailable
+- Joins your home Wi-Fi
+- Automatically determines its local IPv4 subnet
+- Starts a bounded LAN scan after boot
+- Pings local devices with a short timeout
+- Checks likely embedded, MQTT, web, diagnostic, and Mammotion-related TCP ports
+- Ranks likely IoT and Mammotion candidates
+- Saves scan results in ESP32 flash
+- Compares consecutive scans and reports devices that disappeared
+- Provides a browser interface and JSON API
+- Provides a fallback access point for entering or changing Wi-Fi credentials
+- Restricts all automatic and manual probing to private IPv4 networks
 
-It does not transmit bytes to the RTK UART, write Mammotion firmware, connect to BLE devices, scan public IP addresses, or provide a shell.
+The strongest practical identification workflow is:
+
+1. Scan with the RTK3 powered on.
+2. Power the RTK3 off.
+3. Scan again.
+4. Check `missingSinceLastScan`.
+
+The IP that disappeared is the strongest RTK3 candidate.
+
+## Important network limitation
+
+The ESP32-S3 can discover hosts, ping them, and test local TCP services.
+
+A normal Wi-Fi client cannot decrypt another client's WPA-protected unicast traffic. Capturing the RTK3's cloud traffic requires router-side packet capture, port mirroring, or a separate monitor-mode workflow. This firmware does not pretend otherwise.
 
 ## Hardware
 
 - ESP32-S3 development board
 - Data-capable USB cable
-- Two jumper wires for passive UART capture
-- Optional logic analyzer for confirming voltage and baud rate
 
-The default PlatformIO target is `esp32-s3-devkitc-1`. Change the board in `platformio.ini` if your ESP32-S3 uses a different definition.
+The default PlatformIO target is `esp32-s3-devkitc-1`. Change the board in `platformio.ini` if your board uses a different PlatformIO definition.
 
-## Wiring
-
-Default receive pin: GPIO 18.
-
-```text
-Mammotion RTK3 GND  -> ESP32-S3 GND
-Mammotion RTK3 TX   -> ESP32-S3 GPIO 18
-```
-
-Do not connect:
-
-```text
-ESP32-S3 TX -> RTK
-ESP32-S3 3V3 -> RTK
-ESP32-S3 5V  -> RTK
-```
-
-The firmware opens the UART with `txPin = -1`, so the capture path is receive-only. Confirm that the RTK signal is 3.3 V logic before connecting it. Do not feed 5 V UART into an ESP32-S3 GPIO.
-
-To use a different receive pin, change `RTK_RX_PIN` in `include/config.h` or add a build flag.
+No connection to the RTK3 is required.
 
 ## Build and flash from macOS
-
-Install PlatformIO Core:
-
-```bash
-python3 -m pip install --user platformio
-```
-
-Clone and switch to the ESP32-S3 branch:
 
 ```bash
 git clone https://github.com/guy16510/mammotion-rtk3-reverse-engineering.git
 cd mammotion-rtk3-reverse-engineering
 git switch codex/esp32-s3-standalone-probe
-```
 
-Optional, configure home Wi-Fi:
-
-```bash
-cp include/secrets.h.example include/secrets.h
-nano include/secrets.h
-```
-
-Build, test, flash, and monitor:
-
-```bash
+python3 -m pip install --user platformio
 pio test -e native
-pio run -e esp32-s3-devkitc-1
 pio run -e esp32-s3-devkitc-1 -t upload
 pio device monitor -b 115200
 ```
 
-If PlatformIO cannot choose the USB port, list ports and pass it explicitly:
+If PlatformIO cannot determine the USB port:
 
 ```bash
 pio device list
 pio run -e esp32-s3-devkitc-1 -t upload --upload-port /dev/cu.usbmodemXXXX
 ```
 
-## First boot
+## First boot and Wi-Fi setup
 
-The ESP32-S3 always creates this fallback access point:
+The ESP32-S3 always creates a fallback access point:
 
 ```text
 SSID: RTK3-Probe
@@ -97,95 +72,108 @@ Password: rtk3-probe
 URL: http://192.168.4.1/
 ```
 
-If `include/secrets.h` contains valid credentials, the device also joins that Wi-Fi network. The serial monitor prints the assigned address.
+1. Connect your phone or Mac to `RTK3-Probe`.
+2. Open `http://192.168.4.1/`.
+3. Enter your home Wi-Fi SSID and password.
+4. Select **Save and restart**.
+5. Reconnect your phone or Mac to your normal home Wi-Fi.
+6. Open `http://rtk3-probe.local/`.
 
-Change the default access-point password in `include/config.h` before using the device outside a controlled environment.
+The serial monitor also prints the ESP32's assigned home-network IP address.
 
-## Run a passive UART sweep
+You may alternatively compile credentials into `include/secrets.h`, but it is no longer required.
 
-1. Power the ESP32-S3 over USB.
-2. Open the web interface.
-3. Connect RTK GND and RTK TX using the receive-only wiring above.
-4. Set seconds per baud, 12 seconds is the default.
-5. Select **Start**.
-6. Power-cycle or exercise the RTK while the sweep runs.
-7. Open **Summary** after all eight baud rates complete.
+## Automatic discovery
 
-The firmware tests:
+Once the ESP32 joins your home network, it automatically scans the subnet.
 
-```text
-9600
-19200
-38400
-57600
-115200
-230400
-460800
-921600
-```
+The scanner:
 
-Each baud sample is stored as `/baud-<rate>.bin`. The default cap is 64 KiB per baud to avoid exhausting the normal ESP32 filesystem partition.
+- Uses the ESP32's assigned IP and subnet mask
+- Caps unexpectedly large networks to the ESP32's local `/24`
+- Probes at most 254 host addresses
+- Uses short ICMP and TCP timeouts
+- Runs in a background task so the web interface remains responsive
+- Saves final results to `/lan-scan.json`
 
-## Interpret results
+Likely candidates are ranked using reachable services. Ports `50001-50003` receive a strong Mammotion heuristic score, while MQTT ports `1883` and `8883` receive a weaker IoT score. This ranking is a lead, not proof.
 
-A strong RTCM result looks like:
+## Browser workflow
+
+Open the device page and use:
+
+- **Scan my network** to start another scan
+- **Show ranked results** to inspect discovered devices
+- **Stop** to cancel a scan
+- **Probe** to test a known private IP and selected ports
+
+For reliable identification, use the power-cycle comparison instead of trusting a port heuristic alone.
+
+## Result example
 
 ```json
 {
-  "baud": 115200,
-  "rtcmFrames": 42,
-  "rtcmCrcErrors": 0,
-  "rtcmTypes": [1005, 1077, 1087]
+  "completed": true,
+  "localIp": "192.168.1.42",
+  "gateway": "192.168.1.1",
+  "hosts": [
+    {
+      "ip": "192.168.1.123",
+      "ping": true,
+      "rttMs": 4,
+      "gateway": false,
+      "newSinceLastScan": false,
+      "score": 75,
+      "classification": "strong-mammotion-candidate",
+      "openPorts": [50001]
+    }
+  ],
+  "missingSinceLastScan": []
 }
 ```
-
-Prioritize evidence in this order:
-
-1. Valid RTCM3 frames with stable message types
-2. Repeated UBX sync markers
-3. Repeated NMEA prefixes
-4. Non-empty binary data that changes with RTK activity
-5. Empty samples, which usually mean the wrong wire, pin, direction, voltage, or interface
-
-CRC-valid RTCM frames are substantially stronger evidence than merely finding `0xD3` bytes.
 
 ## HTTP endpoints
 
 ```text
 GET  /healthz
 GET  /api/status
-POST /api/capture/start?seconds=12
-POST /api/capture/stop
-GET  /api/summary
-GET  /api/files
-GET  /api/file?name=/baud-115200.bin
+POST /api/lan/scan/start
+POST /api/lan/scan/stop
+GET  /api/lan/scan/status
+GET  /api/lan/scan/results
+POST /api/probe?ip=192.168.1.123&ports=80,443,1883,8883,50001,50002,50003
 POST /api/wifi/scan
-POST /api/ble/scan
-POST /api/probe?ip=192.168.1.123&ports=80,443,1883,8883
+POST /api/wifi/configure
+POST /api/wifi/clear
 ```
 
-Network probing accepts private IPv4 addresses only and a maximum of 16 unique ports per request. It is a TCP connect check, not an unrestricted scanner or packet capture system.
+Manual probing accepts only private IPv4 addresses and a bounded number of unique ports.
 
-## Automated validation
+## Validation
 
-The GitHub Actions workflow runs:
+GitHub Actions runs:
 
 ```bash
 pio test -e native
 pio run -e esp32-s3-devkitc-1
 ```
 
-The native tests validate CRC-24Q, RTCM framing across chunk boundaries, CRC rejection, UBX detection, and NMEA detection. Hardware behavior still requires the actual ESP32-S3 and RTK signal.
+The current network-first firmware compiles successfully for the generic ESP32-S3 DevKitC target. The existing portable protocol tests also remain green.
 
-## Current limitations
+Hardware validation still requires your actual ESP32-S3 and home network. Specifically, the build cannot prove that your access point permits client-to-client traffic, that the RTK3 answers ICMP, or that it exposes an inbound TCP service.
 
-- Internal flash stores bounded samples, not long-duration packet captures.
-- Wi-Fi scanning reports access-point metadata, not full 802.11 traffic.
-- BLE scanning records advertisements only.
-- The firmware cannot inspect encrypted Mammotion application traffic by itself.
-- Pin 18 is only a default and may need to change for your board.
-- This branch does not expose an MCP server directly from the microcontroller.
+## If the RTK3 does not appear
+
+Possible reasons:
+
+- Your Wi-Fi network has client isolation enabled
+- The RTK3 is on a guest network or different VLAN
+- The ESP32 is on a different subnet
+- The RTK3 ignores ICMP and exposes no tested inbound TCP ports
+- The RTK3 communicates only through outbound cloud connections
+
+The next escalation is router-side evidence, such as DHCP leases, ARP tables, DNS logs, firewall logs, or packet capture. That is more reliable than attempting to sniff encrypted traffic from another Wi-Fi client.
 
 ## Safety and privacy
 
-Captured files can contain device identifiers, network names, local addresses, and location-related GNSS data. Review files before publishing them. Only probe equipment and networks you own or are authorized to test.
+Scan output can contain local IP addresses, Wi-Fi names, and device metadata. Review results before publishing them. Probe only networks and equipment you own or are authorized to test.
