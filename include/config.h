@@ -1,12 +1,7 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
-
-// Receive-only connection. Connect RTK TX to this pin and share GND.
-// Never connect an ESP32 TX pin to the RTK while passively probing.
-#ifndef RTK_RX_PIN
-#define RTK_RX_PIN 18
-#endif
 
 #ifndef STATUS_LED_PIN
 #define STATUS_LED_PIN -1
@@ -24,29 +19,39 @@
 #define DEVICE_HOSTNAME "rtk3-probe"
 #endif
 
-#ifndef CAPTURE_SECONDS_PER_BAUD
-#define CAPTURE_SECONDS_PER_BAUD 12
+#ifndef AUTO_LAN_SCAN_ON_BOOT
+#define AUTO_LAN_SCAN_ON_BOOT 1
 #endif
 
-#ifndef MAX_CAPTURE_SECONDS_PER_BAUD
-#define MAX_CAPTURE_SECONDS_PER_BAUD 60
+// A scan is intentionally bounded. Home networks are normally /24; larger
+// subnets are capped to the ESP32's local /24 to avoid probing thousands of IPs.
+#ifndef MAX_LAN_SCAN_HOSTS
+#define MAX_LAN_SCAN_HOSTS 254U
 #endif
 
-// Eight baud samples at 64 KiB each fit comfortably in the default LittleFS
-// partition. Increase only after selecting a larger filesystem partition or SD.
-#ifndef MAX_CAPTURE_BYTES_PER_BAUD
-#define MAX_CAPTURE_BYTES_PER_BAUD (64U * 1024U)
+#ifndef LAN_PING_TIMEOUT_MS
+#define LAN_PING_TIMEOUT_MS 150U
+#endif
+
+#ifndef LAN_TCP_TIMEOUT_MS
+#define LAN_TCP_TIMEOUT_MS 80U
 #endif
 
 #ifndef MAX_PROBE_PORTS
-#define MAX_PROBE_PORTS 16
+#define MAX_PROBE_PORTS 20U
 #endif
 
-#ifndef TCP_CONNECT_TIMEOUT_MS
-#define TCP_CONNECT_TIMEOUT_MS 500
-#endif
+// Ports commonly associated with embedded web services, MQTT, discovery,
+// diagnostics, and the 50001-50003 range observed around Mammotion devices.
+static constexpr uint16_t LAN_CANDIDATE_PORTS[] = {
+    22, 53, 80, 443, 554, 1883, 8883, 5000, 5001, 50001,
+    50002, 50003, 5353, 8000, 8080, 8443, 9000, 10000};
+static constexpr size_t LAN_CANDIDATE_PORT_COUNT =
+    sizeof(LAN_CANDIDATE_PORTS) / sizeof(LAN_CANDIDATE_PORTS[0]);
 
-static constexpr uint32_t RTK_BAUD_RATES[] = {
-    9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
-static constexpr size_t RTK_BAUD_RATE_COUNT =
-    sizeof(RTK_BAUD_RATES) / sizeof(RTK_BAUD_RATES[0]);
+// Hosts that ignore ICMP are checked only on this smaller set to keep a full
+// subnet scan reasonably fast.
+static constexpr uint16_t LAN_FALLBACK_PORTS[] = {
+    80, 443, 1883, 8883, 50001, 50002, 50003};
+static constexpr size_t LAN_FALLBACK_PORT_COUNT =
+    sizeof(LAN_FALLBACK_PORTS) / sizeof(LAN_FALLBACK_PORTS[0]);
