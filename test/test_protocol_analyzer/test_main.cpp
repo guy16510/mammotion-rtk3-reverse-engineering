@@ -2,6 +2,9 @@
 
 #include "ProtocolAnalyzer.h"
 
+void setUp() {}
+void tearDown() {}
+
 void test_crc24q_known_rtcm_frame() {
   const uint8_t frame[] = {0xD3, 0x00, 0x02, 0x3E, 0xD0, 0xA4, 0xE0, 0x00};
   TEST_ASSERT_EQUAL_HEX32(0xA4E000,
@@ -37,7 +40,7 @@ void test_ubx_and_nmea_markers() {
   analyzer.feed(bytes, sizeof(bytes));
   TEST_ASSERT_EQUAL_UINT32(1, analyzer.stats().ubxSyncMarkers);
   TEST_ASSERT_EQUAL_UINT32(2, analyzer.stats().nmeaPrefixes);
-  TEST_ASSERT_GREATER_THAN(0.5, analyzer.printableRatio());
+  TEST_ASSERT_TRUE(analyzer.printableRatio() > 0.5);
 }
 
 int main(int, char**) {
