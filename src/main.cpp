@@ -21,44 +21,23 @@
 #else
 #define WIFI_SSID ""
 #define WIFI_PASSWORD ""
+#define RTK3_IP ""
+#define RTK3_LORA_ID ""
 #endif
 
 namespace {
 
 WebServer server(80);
 Preferences preferences;
-SemaphoreHandle_t scanMutex = nullptr;
-TaskHandle_t scanTaskHandle = nullptr;
+SemaphoreHandle_t probeMutex = nullptr;
+TaskHandle_t probeTaskHandle = nullptr;
 uint32_t restartAtMs = 0;
 
-struct HostResult {
-  IPAddress ip;
-  bool ping = false;
-  uint32_t rttMs = 0;
-  bool gateway = false;
-  bool newSinceLastScan = false;
-  int score = 0;
-  String classification;
-  std::vector<uint16_t> openPorts;
+struct TargetConfig {
+  String ip;
+  String loraId;
+  String ports;
 };
-
-struct LanScanState {
-  bool active = false;
-  bool completed = false;
-  bool cancelled = false;
-  bool cappedToLocal24 = false;
-  volatile bool cancelRequested = false;
-  uint16_t progress = 0;
-  uint16_t total = 0;
-  IPAddress currentIp;
-  IPAddress localIp;
-  IPAddress gateway;
-  IPAddress subnetMask;
-  String error;
-  std::vector<HostResult> hosts;
-  std::vector<IPAddress> previousIps;
-  std::vector<IPAddress> missingSinceLastScan;
-} lanScan;
 
 struct PingContext {
   SemaphoreHandle_t done = nullptr;
@@ -66,9 +45,35 @@ struct PingContext {
   uint32_t rttMs = 0;
 };
 
+struct PortResult {
+  uint16_t port = 0;
+  bool open = false;
+  uint32_t connectMs = 0;
+  uint32_t receivedBytes = 0;
+  bool loraMatch = false;
+  String evidence;
+};
+
+struct ProbeState {
+  bool active = false;
+  bool completed = false;
+  bool cancelled = false;
+  volatile bool cancelRequested = false;
+  uint16_t progress = 0;
+  uint16_t total = 0;
+  uint32_t startedMs = 0;
+  uint32_t durationMs = 0;
+  String error;
+  TargetConfig target;
+  bool ping = false;
+  uint32_t rttMs = 0;
+  bool loraObserved = false;
+  std::vector<PortResult> ports;
+} probe;
+
 String jsonEscape(const String& value) {
   String out;
-  out.reserve(value.length() + 8);
+  out.reserve(value.length() + 16);
   for (size_t i = 0; i < value.length(); ++i) {
     const char c = value[i];
     switch (c) {
@@ -89,22 +94,6 @@ void setLed(bool on) {
   if (STATUS_LED_PIN >= 0) digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
 }
 
-uint32_t ipToUint(const IPAddress& ip) {
-  return (static_cast<uint32_t>(ip[0]) << 24U) |
-         (static_cast<uint32_t>(ip[1]) << 16U) |
-         (static_cast<uint32_t>(ip[2]) << 8U) |
-         static_cast<uint32_t>(ip[3]);
-}
-
-IPAddress uintToIp(uint32_t value) {
-  return IPAddress((value >> 24U) & 0xffU, (value >> 16U) & 0xffU,
-                   (value >> 8U) & 0xffU, value & 0xffU);
-}
-
-bool sameIp(const IPAddress& a, const IPAddress& b) {
-  return ipToUint(a) == ipToUint(b);
-}
-
 bool isPrivateAddress(const IPAddress& ip) {
   const uint8_t a = ip[0];
   const uint8_t b = ip[1];
@@ -112,10 +101,88 @@ bool isPrivateAddress(const IPAddress& ip) {
          (a == 192 && b == 168) || a == 127;
 }
 
-bool containsIp(const std::vector<IPAddress>& values, const IPAddress& value) {
-  return std::any_of(values.begin(), values.end(), [&](const IPAddress& item) {
-    return sameIp(item, value);
-  });
+String defaultPortsString() {
+  String value;
+  for (size_t i = 0; i < DEFAULT_TARGET_PORT_COUNT; ++i) {
+    if (i) value += ',';
+    value += String(DEFAULT_TARGET_PORTS[i]);
+  }
+  return value;
+}
+
+std::vector<uint16_t> parsePorts(const String& input) {
+  std::vector<uint16_t> ports;
+  int start = 0;
+  while (start < static_cast<int>(input.length()) &&
+         ports.size() < MAX_PROBE_PORTS) {
+    int comma = input.indexOf(',', start);
+    if (comma < 0) comma = input.length();
+    const long value = input.substring(start, comma).toInt();
+    if (value >= 1 && value <= 65535 &&
+        std::find(ports.begin(), ports.end(), static_cast<uint16_t>(value)) ==
+            ports.end()) {
+      ports.push_back(static_cast<uint16_t>(value));
+    }
+    start = comma + 1;
+  }
+  return ports;
+}
+
+String normalizePorts(const std::vector<uint16_t>& ports) {
+  String value;
+  for (size_t i = 0; i < ports.size(); ++i) {
+    if (i) value += ',';
+    value += String(ports[i]);
+  }
+  return value;
+}
+
+bool validLoraId(const String& value) {
+  if (value.isEmpty() || value.length() > 64) return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    if (!(isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ||
+          c == ':' || c == '.')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+TargetConfig loadTargetConfig() {
+  TargetConfig config;
+  config.ip = RTK3_IP;
+  config.loraId = RTK3_LORA_ID;
+  config.ports = defaultPortsString();
+
+  preferences.begin("rtk3-probe", true);
+  const String savedIp = preferences.getString("target_ip", "");
+  const String savedLoraId = preferences.getString("lora_id", "");
+  const String savedPorts = preferences.getString("ports", "");
+  preferences.end();
+
+  if (!savedIp.isEmpty()) config.ip = savedIp;
+  if (!savedLoraId.isEmpty()) config.loraId = savedLoraId;
+  if (!savedPorts.isEmpty()) config.ports = savedPorts;
+  return config;
+}
+
+bool validateTargetConfig(const TargetConfig& config, IPAddress& address,
+                          std::vector<uint16_t>& ports, String& error) {
+  if (!address.fromString(config.ip) || !isPrivateAddress(address)) {
+    error = "RTK3 IP must be a private IPv4 address";
+    return false;
+  }
+  if (!validLoraId(config.loraId)) {
+    error = "LoRa ID must be 1 to 64 letters, numbers, dots, colons, dashes, or underscores";
+    return false;
+  }
+  ports = parsePorts(config.ports);
+  if (ports.empty()) {
+    error = "at least one valid TCP port is required";
+    return false;
+  }
+  return true;
 }
 
 void onPingSuccess(esp_ping_handle_t handle, void* args) {
@@ -163,10 +230,8 @@ bool pingOnce(const IPAddress& target, uint32_t timeoutMs, uint32_t& rttMs) {
     return false;
   }
 
-  bool started = esp_ping_start(handle) == ESP_OK;
-  if (started) {
-    xSemaphoreTake(context.done, pdMS_TO_TICKS(timeoutMs + 500U));
-  }
+  const bool started = esp_ping_start(handle) == ESP_OK;
+  if (started) xSemaphoreTake(context.done, pdMS_TO_TICKS(timeoutMs + 500U));
   esp_ping_stop(handle);
   esp_ping_delete_session(handle);
   vSemaphoreDelete(context.done);
@@ -174,257 +239,270 @@ bool pingOnce(const IPAddress& target, uint32_t timeoutMs, uint32_t& rttMs) {
   return started && context.success;
 }
 
-bool portOpen(const IPAddress& target, uint16_t port, uint32_t timeoutMs) {
+bool isPlainHttpPort(uint16_t port) {
+  return port == 80 || port == 5000 || port == 8000 || port == 8080;
+}
+
+String evidenceText(const std::vector<uint8_t>& bytes) {
+  String out;
+  out.reserve(bytes.size() * 2U);
+  char encoded[5];
+  for (const uint8_t byte : bytes) {
+    if ((byte >= 32 && byte <= 126) || byte == '\r' || byte == '\n' ||
+        byte == '\t') {
+      out += static_cast<char>(byte);
+    } else {
+      snprintf(encoded, sizeof(encoded), "\\x%02X", byte);
+      out += encoded;
+    }
+  }
+  return out;
+}
+
+bool containsCaseInsensitive(const String& haystack, const String& needle) {
+  if (needle.isEmpty()) return false;
+  String lowerHaystack = haystack;
+  String lowerNeedle = needle;
+  lowerHaystack.toLowerCase();
+  lowerNeedle.toLowerCase();
+  return lowerHaystack.indexOf(lowerNeedle) >= 0;
+}
+
+PortResult probePort(const IPAddress& target, const String& loraId,
+                     uint16_t port) {
+  PortResult result;
+  result.port = port;
+
   WiFiClient client;
-  const bool open = client.connect(target, port, timeoutMs);
+  const uint32_t started = millis();
+  result.open = client.connect(target, port, TARGET_TCP_TIMEOUT_MS);
+  result.connectMs = millis() - started;
+  if (!result.open) {
+    client.stop();
+    return result;
+  }
+
+  if (isPlainHttpPort(port)) {
+    client.print("GET / HTTP/1.1\r\nHost: ");
+    client.print(target.toString());
+    client.print("\r\nUser-Agent: RTK3-ESP32-Probe/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+  }
+
+  std::vector<uint8_t> received;
+  received.reserve(MAX_BANNER_BYTES);
+  const uint32_t deadline = millis() + TARGET_BANNER_WAIT_MS;
+  while (static_cast<int32_t>(deadline - millis()) > 0 &&
+         received.size() < MAX_BANNER_BYTES) {
+    while (client.available() > 0 && received.size() < MAX_BANNER_BYTES) {
+      const int value = client.read();
+      if (value < 0) break;
+      received.push_back(static_cast<uint8_t>(value));
+    }
+    if (!client.connected() && client.available() == 0) break;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
   client.stop();
-  return open;
+
+  result.receivedBytes = received.size();
+  result.evidence = evidenceText(received);
+  result.loraMatch = containsCaseInsensitive(result.evidence, loraId);
+  return result;
 }
 
-int scoreHost(const HostResult& host) {
-  if (host.gateway) return -100;
-  int score = host.ping ? 5 : 0;
-  for (const uint16_t port : host.openPorts) {
-    if (port >= 50001 && port <= 50003) score += 70;
-    else if (port == 1883 || port == 8883) score += 35;
-    else if (port == 80 || port == 443 || port == 8080 || port == 8443) score += 12;
-    else score += 5;
-  }
-  return score;
-}
-
-String classifyHost(const HostResult& host) {
-  if (host.gateway) return "router";
-  if (host.score >= 70) return "strong-mammotion-candidate";
-  if (host.score >= 30) return "possible-iot-candidate";
-  if (!host.openPorts.empty()) return "network-service";
-  return "reachable-device";
-}
-
-String portsJson(const std::vector<uint16_t>& ports) {
-  String json = "[";
-  for (size_t i = 0; i < ports.size(); ++i) {
-    if (i) json += ',';
-    json += String(ports[i]);
-  }
-  json += ']';
+String portResultJson(const PortResult& result) {
+  String json;
+  json.reserve(220 + result.evidence.length());
+  json += "{\"port\":" + String(result.port);
+  json += ",\"open\":" + String(result.open ? "true" : "false");
+  json += ",\"connectMs\":" + String(result.connectMs);
+  json += ",\"receivedBytes\":" + String(result.receivedBytes);
+  json += ",\"loraMatch\":" + String(result.loraMatch ? "true" : "false");
+  json += ",\"evidence\":\"" + jsonEscape(result.evidence) + "\"}";
   return json;
 }
 
-String hostJson(const HostResult& host) {
+String probeResultsJsonUnlocked() {
   String json;
-  json.reserve(260);
-  json += "{\"ip\":\"" + host.ip.toString() + "\"";
-  json += ",\"ping\":" + String(host.ping ? "true" : "false");
-  json += ",\"rttMs\":" + String(host.rttMs);
-  json += ",\"gateway\":" + String(host.gateway ? "true" : "false");
-  json += ",\"newSinceLastScan\":" + String(host.newSinceLastScan ? "true" : "false");
-  json += ",\"score\":" + String(host.score);
-  json += ",\"classification\":\"" + jsonEscape(host.classification) + "\"";
-  json += ",\"openPorts\":" + portsJson(host.openPorts);
-  json += '}';
-  return json;
-}
-
-String lanResultsJsonUnlocked() {
-  String json;
-  json.reserve(1024 + lanScan.hosts.size() * 220);
-  json += "{\"completed\":" + String(lanScan.completed ? "true" : "false");
-  json += ",\"cancelled\":" + String(lanScan.cancelled ? "true" : "false");
-  json += ",\"localIp\":\"" + lanScan.localIp.toString() + "\"";
-  json += ",\"gateway\":\"" + lanScan.gateway.toString() + "\"";
-  json += ",\"subnetMask\":\"" + lanScan.subnetMask.toString() + "\"";
-  json += ",\"cappedToLocal24\":" + String(lanScan.cappedToLocal24 ? "true" : "false");
-  json += ",\"hosts\":[";
-  for (size_t i = 0; i < lanScan.hosts.size(); ++i) {
+  json.reserve(1024 + probe.ports.size() * 320);
+  json += "{\"active\":" + String(probe.active ? "true" : "false");
+  json += ",\"completed\":" + String(probe.completed ? "true" : "false");
+  json += ",\"cancelled\":" + String(probe.cancelled ? "true" : "false");
+  json += ",\"targetIp\":\"" + jsonEscape(probe.target.ip) + "\"";
+  json += ",\"loraId\":\"" + jsonEscape(probe.target.loraId) + "\"";
+  json += ",\"ping\":" + String(probe.ping ? "true" : "false");
+  json += ",\"rttMs\":" + String(probe.rttMs);
+  json += ",\"loraObserved\":" + String(probe.loraObserved ? "true" : "false");
+  json += ",\"durationMs\":" + String(probe.durationMs);
+  json += ",\"error\":\"" + jsonEscape(probe.error) + "\"";
+  json += ",\"ports\":[";
+  for (size_t i = 0; i < probe.ports.size(); ++i) {
     if (i) json += ',';
-    json += hostJson(lanScan.hosts[i]);
-  }
-  json += "],\"missingSinceLastScan\":[";
-  for (size_t i = 0; i < lanScan.missingSinceLastScan.size(); ++i) {
-    if (i) json += ',';
-    json += "\"" + lanScan.missingSinceLastScan[i].toString() + "\"";
+    json += portResultJson(probe.ports[i]);
   }
   json += "]}";
   return json;
 }
 
-String lanResultsJson() {
-  if (!scanMutex) return "{\"error\":\"scanner not initialized\"}";
-  xSemaphoreTake(scanMutex, portMAX_DELAY);
-  String json = lanResultsJsonUnlocked();
-  xSemaphoreGive(scanMutex);
+String probeResultsJson() {
+  if (!probeMutex) return "{\"error\":\"probe not initialized\"}";
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  String json = probeResultsJsonUnlocked();
+  xSemaphoreGive(probeMutex);
   return json;
 }
 
-String lanStatusJson() {
-  if (!scanMutex) return "{\"error\":\"scanner not initialized\"}";
-  xSemaphoreTake(scanMutex, portMAX_DELAY);
-  String json = "{\"active\":" + String(lanScan.active ? "true" : "false");
-  json += ",\"completed\":" + String(lanScan.completed ? "true" : "false");
-  json += ",\"cancelled\":" + String(lanScan.cancelled ? "true" : "false");
-  json += ",\"progress\":" + String(lanScan.progress);
-  json += ",\"total\":" + String(lanScan.total);
-  json += ",\"currentIp\":\"" + lanScan.currentIp.toString() + "\"";
-  json += ",\"found\":" + String(lanScan.hosts.size());
-  json += ",\"error\":\"" + jsonEscape(lanScan.error) + "\"}";
-  xSemaphoreGive(scanMutex);
+String probeStatusJson() {
+  if (!probeMutex) return "{\"error\":\"probe not initialized\"}";
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  String json = "{\"active\":" + String(probe.active ? "true" : "false");
+  json += ",\"completed\":" + String(probe.completed ? "true" : "false");
+  json += ",\"cancelled\":" + String(probe.cancelled ? "true" : "false");
+  json += ",\"progress\":" + String(probe.progress);
+  json += ",\"total\":" + String(probe.total);
+  json += ",\"targetIp\":\"" + jsonEscape(probe.target.ip) + "\"";
+  json += ",\"error\":\"" + jsonEscape(probe.error) + "\"}";
+  xSemaphoreGive(probeMutex);
   return json;
 }
 
-void persistLanResults() {
-  const String json = lanResultsJson();
-  File file = LittleFS.open("/lan-scan.json", FILE_WRITE);
+void persistProbeResults() {
+  File file = LittleFS.open("/rtk3-probe.json", FILE_WRITE);
   if (!file) return;
-  file.print(json);
+  file.print(probeResultsJson());
   file.close();
 }
 
-void lanScanTask(void*) {
-  uint32_t localValue;
-  uint32_t networkValue;
-  uint32_t broadcastValue;
-  std::vector<IPAddress> previous;
+void targetProbeTask(void*) {
+  TargetConfig target;
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  target = probe.target;
+  xSemaphoreGive(probeMutex);
 
-  xSemaphoreTake(scanMutex, portMAX_DELAY);
-  localValue = ipToUint(lanScan.localIp);
-  const uint32_t maskValue = ipToUint(lanScan.subnetMask);
-  networkValue = localValue & maskValue;
-  broadcastValue = networkValue | ~maskValue;
-  uint32_t hostCount = broadcastValue > networkValue + 1U
-                           ? broadcastValue - networkValue - 1U
-                           : 0U;
-  if (hostCount == 0U || hostCount > MAX_LAN_SCAN_HOSTS) {
-    networkValue = localValue & 0xffffff00U;
-    broadcastValue = networkValue | 0x000000ffU;
-    lanScan.cappedToLocal24 = true;
+  IPAddress address;
+  std::vector<uint16_t> ports;
+  String validationError;
+  if (!validateTargetConfig(target, address, ports, validationError)) {
+    xSemaphoreTake(probeMutex, portMAX_DELAY);
+    probe.active = false;
+    probe.error = validationError;
+    xSemaphoreGive(probeMutex);
+    setLed(false);
+    probeTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+    return;
   }
-  previous = lanScan.previousIps;
-  lanScan.total = static_cast<uint16_t>(broadcastValue - networkValue - 2U);
-  xSemaphoreGive(scanMutex);
 
-  for (uint32_t value = networkValue + 1U; value < broadcastValue; ++value) {
-    if (value == localValue) continue;
+  uint32_t rttMs = 0;
+  const bool ping = pingOnce(address, TARGET_PING_TIMEOUT_MS, rttMs);
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  probe.ping = ping;
+  probe.rttMs = rttMs;
+  xSemaphoreGive(probeMutex);
 
-    xSemaphoreTake(scanMutex, portMAX_DELAY);
-    const bool cancel = lanScan.cancelRequested;
-    lanScan.currentIp = uintToIp(value);
-    xSemaphoreGive(scanMutex);
+  for (const uint16_t port : ports) {
+    xSemaphoreTake(probeMutex, portMAX_DELAY);
+    const bool cancel = probe.cancelRequested;
+    xSemaphoreGive(probeMutex);
     if (cancel) break;
 
-    const IPAddress target = uintToIp(value);
-    uint32_t rttMs = 0;
-    HostResult result;
-    result.ip = target;
-    result.gateway = sameIp(target, WiFi.gatewayIP());
-    result.ping = pingOnce(target, LAN_PING_TIMEOUT_MS, rttMs);
-    result.rttMs = rttMs;
-
-    const uint16_t* ports = result.ping ? LAN_CANDIDATE_PORTS : LAN_FALLBACK_PORTS;
-    const size_t portCount = result.ping ? LAN_CANDIDATE_PORT_COUNT : LAN_FALLBACK_PORT_COUNT;
-    for (size_t i = 0; i < portCount; ++i) {
-      if (portOpen(target, ports[i], LAN_TCP_TIMEOUT_MS)) result.openPorts.push_back(ports[i]);
-      if (lanScan.cancelRequested) break;
-    }
-
-    if (result.ping || !result.openPorts.empty()) {
-      result.newSinceLastScan = !previous.empty() && !containsIp(previous, target);
-      result.score = scoreHost(result);
-      result.classification = classifyHost(result);
-      xSemaphoreTake(scanMutex, portMAX_DELAY);
-      lanScan.hosts.push_back(result);
-      xSemaphoreGive(scanMutex);
-    }
-
-    xSemaphoreTake(scanMutex, portMAX_DELAY);
-    ++lanScan.progress;
-    xSemaphoreGive(scanMutex);
+    PortResult result = probePort(address, target.loraId, port);
+    xSemaphoreTake(probeMutex, portMAX_DELAY);
+    if (result.loraMatch) probe.loraObserved = true;
+    probe.ports.push_back(result);
+    ++probe.progress;
+    xSemaphoreGive(probeMutex);
     vTaskDelay(1);
   }
 
-  xSemaphoreTake(scanMutex, portMAX_DELAY);
-  lanScan.cancelled = lanScan.cancelRequested;
-  lanScan.active = false;
-  lanScan.completed = !lanScan.cancelled;
-  lanScan.currentIp = IPAddress();
-  std::sort(lanScan.hosts.begin(), lanScan.hosts.end(), [](const HostResult& a, const HostResult& b) {
-    if (a.score != b.score) return a.score > b.score;
-    return ipToUint(a.ip) < ipToUint(b.ip);
-  });
-  lanScan.missingSinceLastScan.clear();
-  for (const IPAddress& previousIp : previous) {
-    const bool stillPresent = std::any_of(lanScan.hosts.begin(), lanScan.hosts.end(),
-                                         [&](const HostResult& host) {
-                                           return sameIp(host.ip, previousIp);
-                                         });
-    if (!stillPresent) lanScan.missingSinceLastScan.push_back(previousIp);
-  }
-  xSemaphoreGive(scanMutex);
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  probe.cancelled = probe.cancelRequested;
+  probe.active = false;
+  probe.completed = !probe.cancelled;
+  probe.durationMs = millis() - probe.startedMs;
+  xSemaphoreGive(probeMutex);
 
-  persistLanResults();
+  persistProbeResults();
   setLed(false);
-  scanTaskHandle = nullptr;
+  probeTaskHandle = nullptr;
   vTaskDelete(nullptr);
 }
 
-bool startLanScan() {
-  if (WiFi.status() != WL_CONNECTED || !scanMutex) return false;
+bool startTargetProbe() {
+  if (WiFi.status() != WL_CONNECTED || !probeMutex) return false;
 
-  xSemaphoreTake(scanMutex, portMAX_DELAY);
-  if (lanScan.active) {
-    xSemaphoreGive(scanMutex);
+  const TargetConfig target = loadTargetConfig();
+  IPAddress address;
+  std::vector<uint16_t> ports;
+  String validationError;
+  if (!validateTargetConfig(target, address, ports, validationError)) {
+    xSemaphoreTake(probeMutex, portMAX_DELAY);
+    probe.error = validationError;
+    xSemaphoreGive(probeMutex);
     return false;
   }
-  lanScan.previousIps.clear();
-  for (const HostResult& host : lanScan.hosts) lanScan.previousIps.push_back(host.ip);
-  lanScan.hosts.clear();
-  lanScan.missingSinceLastScan.clear();
-  lanScan.active = true;
-  lanScan.completed = false;
-  lanScan.cancelled = false;
-  lanScan.cappedToLocal24 = false;
-  lanScan.cancelRequested = false;
-  lanScan.progress = 0;
-  lanScan.total = 0;
-  lanScan.currentIp = IPAddress();
-  lanScan.localIp = WiFi.localIP();
-  lanScan.gateway = WiFi.gatewayIP();
-  lanScan.subnetMask = WiFi.subnetMask();
-  lanScan.error = "";
-  xSemaphoreGive(scanMutex);
 
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  if (probe.active) {
+    xSemaphoreGive(probeMutex);
+    return false;
+  }
+  probe = ProbeState{};
+  probe.active = true;
+  probe.target = target;
+  probe.total = ports.size();
+  probe.startedMs = millis();
+  xSemaphoreGive(probeMutex);
+
+  LittleFS.remove("/rtk3-probe.json");
   setLed(true);
-  const BaseType_t created = xTaskCreate(lanScanTask, "lan-scan", 8192, nullptr, 1,
-                                         &scanTaskHandle);
+  const BaseType_t created =
+      xTaskCreate(targetProbeTask, "rtk3-probe", 10240, nullptr, 1,
+                  &probeTaskHandle);
   if (created != pdPASS) {
-    xSemaphoreTake(scanMutex, portMAX_DELAY);
-    lanScan.active = false;
-    lanScan.error = "failed to create scan task";
-    xSemaphoreGive(scanMutex);
+    xSemaphoreTake(probeMutex, portMAX_DELAY);
+    probe.active = false;
+    probe.error = "failed to create target probe task";
+    xSemaphoreGive(probeMutex);
     setLed(false);
     return false;
   }
   return true;
 }
 
-void stopLanScan() {
-  if (!scanMutex) return;
-  xSemaphoreTake(scanMutex, portMAX_DELAY);
-  lanScan.cancelRequested = true;
-  xSemaphoreGive(scanMutex);
+void stopTargetProbe() {
+  if (!probeMutex) return;
+  xSemaphoreTake(probeMutex, portMAX_DELAY);
+  probe.cancelRequested = true;
+  xSemaphoreGive(probeMutex);
+}
+
+String targetConfigJson() {
+  const TargetConfig target = loadTargetConfig();
+  String json = "{\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
+  json += ",\"loraId\":\"" + jsonEscape(target.loraId) + "\"";
+  json += ",\"ports\":\"" + jsonEscape(target.ports) + "\"}";
+  return json;
 }
 
 String statusJson() {
+  const TargetConfig target = loadTargetConfig();
+  IPAddress address;
+  std::vector<uint16_t> ports;
+  String error;
+  const bool configured = validateTargetConfig(target, address, ports, error);
+
   String json = "{\"ok\":true";
   json += ",\"hostname\":\"" + String(DEVICE_HOSTNAME) + "\"";
-  json += ",\"stationConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json += ",\"stationConnected\":" +
+          String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   json += ",\"stationSsid\":\"" + jsonEscape(WiFi.SSID()) + "\"";
   json += ",\"stationIp\":\"" + WiFi.localIP().toString() + "\"";
-  json += ",\"gateway\":\"" + WiFi.gatewayIP().toString() + "\"";
-  json += ",\"subnetMask\":\"" + WiFi.subnetMask().toString() + "\"";
   json += ",\"apIp\":\"" + WiFi.softAPIP().toString() + "\"";
+  json += ",\"targetConfigured\":" + String(configured ? "true" : "false");
+  json += ",\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
+  json += ",\"loraId\":\"" + jsonEscape(target.loraId) + "\"";
   json += ",\"freeHeap\":" + String(ESP.getFreeHeap());
-  json += ",\"scan\":" + lanStatusJson();
+  json += ",\"probe\":" + probeStatusJson();
   json += '}';
   return json;
 }
@@ -434,45 +512,49 @@ void sendJson(int status, const String& body) {
   server.send(status, "application/json", body);
 }
 
-std::vector<uint16_t> parsePorts(const String& input) {
-  std::vector<uint16_t> ports;
-  int start = 0;
-  while (start < static_cast<int>(input.length()) && ports.size() < MAX_PROBE_PORTS) {
-    int comma = input.indexOf(',', start);
-    if (comma < 0) comma = input.length();
-    const long value = input.substring(start, comma).toInt();
-    if (value >= 1 && value <= 65535 &&
-        std::find(ports.begin(), ports.end(), static_cast<uint16_t>(value)) == ports.end()) {
-      ports.push_back(static_cast<uint16_t>(value));
-    }
-    start = comma + 1;
-  }
-  return ports;
-}
-
-void handleManualProbe() {
-  IPAddress target;
-  if (!server.hasArg("ip") || !target.fromString(server.arg("ip")) ||
-      !isPrivateAddress(target)) {
-    sendJson(400, "{\"error\":\"only private IPv4 targets are allowed\"}");
+void handleTargetConfigure() {
+  if (probe.active) {
+    sendJson(409, "{\"error\":\"stop the active probe before changing the target\"}");
     return;
   }
-  const String portArg = server.hasArg("ports")
-                             ? server.arg("ports")
-                             : "80,443,1883,8883,50001,50002,50003";
-  const std::vector<uint16_t> ports = parsePorts(portArg);
-  uint32_t rttMs = 0;
-  const bool reachable = pingOnce(target, LAN_PING_TIMEOUT_MS, rttMs);
-  String json = "{\"ip\":\"" + target.toString() + "\",\"ping\":" +
-                String(reachable ? "true" : "false") + ",\"rttMs\":" +
-                String(rttMs) + ",\"ports\":[";
-  for (size_t i = 0; i < ports.size(); ++i) {
-    if (i) json += ',';
-    json += "{\"port\":" + String(ports[i]) + ",\"open\":" +
-            String(portOpen(target, ports[i], LAN_TCP_TIMEOUT_MS) ? "true" : "false") + "}";
+
+  TargetConfig target;
+  target.ip = server.arg("ip");
+  target.loraId = server.arg("loraId");
+  target.ports = server.arg("ports");
+  target.ip.trim();
+  target.loraId.trim();
+  target.ports.trim();
+
+  IPAddress address;
+  std::vector<uint16_t> ports;
+  String error;
+  if (!validateTargetConfig(target, address, ports, error)) {
+    sendJson(400, "{\"error\":\"" + jsonEscape(error) + "\"}");
+    return;
   }
-  json += "]}";
-  sendJson(200, json);
+
+  target.ports = normalizePorts(ports);
+  preferences.begin("rtk3-probe", false);
+  preferences.putString("target_ip", target.ip);
+  preferences.putString("lora_id", target.loraId);
+  preferences.putString("ports", target.ports);
+  preferences.end();
+  sendJson(200, targetConfigJson());
+}
+
+void handleTargetClear() {
+  if (probe.active) {
+    sendJson(409, "{\"error\":\"stop the active probe before clearing the target\"}");
+    return;
+  }
+  preferences.begin("rtk3-probe", false);
+  preferences.remove("target_ip");
+  preferences.remove("lora_id");
+  preferences.remove("ports");
+  preferences.end();
+  LittleFS.remove("/rtk3-probe.json");
+  sendJson(200, targetConfigJson());
 }
 
 void handleWifiScan() {
@@ -507,7 +589,8 @@ void handleWifiConfigure() {
 
 void handleWifiClear() {
   preferences.begin("rtk3-probe", false);
-  preferences.clear();
+  preferences.remove("ssid");
+  preferences.remove("password");
   preferences.end();
   restartAtMs = millis() + 1200U;
   sendJson(202, "{\"ok\":true,\"restarting\":true}");
@@ -515,46 +598,56 @@ void handleWifiClear() {
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RTK3 Network Probe</title><style>
-body{font-family:system-ui;margin:2rem;max-width:1000px;background:#111;color:#eee}button,input{font:inherit;padding:.65rem;margin:.25rem}button{cursor:pointer}pre{background:#222;padding:1rem;overflow:auto;white-space:pre-wrap}.row{display:flex;gap:.5rem;flex-wrap:wrap}.card{border:1px solid #444;padding:1rem;margin:1rem 0;border-radius:.5rem}a{color:#8cf}.primary{font-weight:700;padding:.9rem 1.2rem}
-</style></head><body><h1>RTK3 ESP32-S3 Network Probe</h1>
-<div class="card"><h2>Find the RTK3 on this network</h2><p>The ESP32 scans its current subnet automatically after joining Wi-Fi. No RTK IP and no UART wiring are required.</p><div class="row"><button class="primary" onclick="post('/api/lan/scan/start')">Scan my network</button><button onclick="post('/api/lan/scan/stop')">Stop</button><button onclick="get('/api/lan/scan/results')">Show ranked results</button></div><p>For a definitive identification, scan once, power off the RTK3, scan again, and inspect <code>missingSinceLastScan</code>.</p></div>
-<div class="card"><h2>Connect this ESP32 to your Wi-Fi</h2><form id="wifi"><input name="ssid" placeholder="Wi-Fi SSID" required><input name="password" type="password" placeholder="Wi-Fi password"><button>Save and restart</button></form><button onclick="post('/api/wifi/clear')">Clear saved Wi-Fi</button><button onclick="post('/api/wifi/scan')">List nearby Wi-Fi</button></div>
-<div class="card"><h2>Probe one known device</h2><input id="ip" placeholder="192.168.1.123"><input id="ports" value="80,443,1883,8883,50001,50002,50003"><button onclick="post('/api/probe?ip='+encodeURIComponent(ip.value)+'&ports='+encodeURIComponent(ports.value))">Probe</button></div>
-<div class="card"><h2>Important limitation</h2><p>The ESP32 can discover hosts and test local services. A normal Wi-Fi client cannot decrypt another client's WPA-protected unicast traffic, so cloud packet capture requires router-side capture or a separate monitor-mode workflow.</p></div>
-<pre id="out">Loading status...</pre><script>
-const out=document.getElementById('out');async function show(r){let t=await r.text();try{out.textContent=JSON.stringify(JSON.parse(t),null,2)}catch{out.textContent=t}}
-async function get(u){show(await fetch(u))}async function post(u){show(await fetch(u,{method:'POST'}))}
-document.getElementById('wifi').addEventListener('submit',async e=>{e.preventDefault();show(await fetch('/api/wifi/configure',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))}))});
-setInterval(()=>get('/api/status'),3000);get('/api/status');
+<title>RTK3 Direct Probe</title><style>
+body{font-family:system-ui;margin:2rem;max-width:1000px;background:#111;color:#eee}button,input{font:inherit;padding:.65rem;margin:.25rem}button{cursor:pointer}input{min-width:220px}pre{background:#222;padding:1rem;overflow:auto;white-space:pre-wrap}.row{display:flex;gap:.5rem;flex-wrap:wrap}.card{border:1px solid #444;padding:1rem;margin:1rem 0;border-radius:.5rem}.primary{font-weight:700;padding:.9rem 1.2rem}code{color:#9df}
+</style></head><body><h1>RTK3 ESP32-S3 Direct Probe</h1>
+<div class="card"><h2>Known RTK3</h2><p>Save the RTK3 IP and LoRa ID once. The ESP32 probes only that device.</p><form id="target"><div><input name="ip" id="targetIp" placeholder="RTK3 IP, for example 192.168.1.123" required></div><div><input name="loraId" id="loraId" placeholder="LoRa ID" required></div><div><input name="ports" id="targetPorts" placeholder="TCP ports" required></div><button>Save target</button></form><div class="row"><button class="primary" onclick="post('/api/probe/start')">Probe RTK3 now</button><button onclick="post('/api/probe/stop')">Stop</button><button onclick="getOut('/api/probe/results')">Show results</button><button onclick="post('/api/config/clear')">Clear target</button></div></div>
+<div class="card"><h2>Connect this ESP32 to Wi-Fi</h2><form id="wifi"><input name="ssid" placeholder="Wi-Fi SSID" required><input name="password" type="password" placeholder="Wi-Fi password"><button>Save and restart</button></form><button onclick="post('/api/wifi/clear')">Clear saved Wi-Fi</button><button onclick="post('/api/wifi/scan')">List nearby Wi-Fi</button></div>
+<div class="card"><h2>What the probe checks</h2><p>ICMP reachability, direct TCP connectivity, connection timing, plaintext service banners, an HTTP root request on common web ports, and whether any returned evidence contains the configured LoRa ID.</p></div>
+<h2>Status</h2><pre id="status">Loading...</pre><h2>Output</h2><pre id="out">No output yet.</pre><script>
+const statusEl=document.getElementById('status'),out=document.getElementById('out');
+async function parse(r){const t=await r.text();try{return JSON.stringify(JSON.parse(t),null,2)}catch{return t}}
+async function getOut(u){out.textContent=await parse(await fetch(u))}
+async function post(u){out.textContent=await parse(await fetch(u,{method:'POST'}))}
+async function loadConfig(){const c=await (await fetch('/api/config')).json();targetIp.value=c.targetIp||'';loraId.value=c.loraId||'';targetPorts.value=c.ports||''}
+document.getElementById('target').addEventListener('submit',async e=>{e.preventDefault();out.textContent=await parse(await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))}));loadConfig()});
+document.getElementById('wifi').addEventListener('submit',async e=>{e.preventDefault();out.textContent=await parse(await fetch('/api/wifi/configure',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(e.target))}))});
+setInterval(async()=>{statusEl.textContent=await parse(await fetch('/api/status'))},2000);loadConfig();fetch('/api/status').then(parse).then(t=>statusEl.textContent=t);
 </script></body></html>)HTML";
 
 void configureRoutes() {
-  server.on("/", HTTP_GET, [] { server.send_P(200, "text/html", INDEX_HTML); });
-  server.on("/healthz", HTTP_GET, [] { sendJson(200, "{\"ok\":true}"); });
-  server.on("/api/status", HTTP_GET, [] { sendJson(200, statusJson()); });
-  server.on("/api/lan/scan/start", HTTP_POST, [] {
-    if (!startLanScan()) {
-      sendJson(409, "{\"error\":\"scan already active or Wi-Fi is not connected\"}");
+  server.on("/", HTTP_GET,
+            [] { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/healthz", HTTP_GET,
+            [] { sendJson(200, "{\"ok\":true}"); });
+  server.on("/api/status", HTTP_GET,
+            [] { sendJson(200, statusJson()); });
+  server.on("/api/config", HTTP_GET,
+            [] { sendJson(200, targetConfigJson()); });
+  server.on("/api/config", HTTP_POST, handleTargetConfigure);
+  server.on("/api/config/clear", HTTP_POST, handleTargetClear);
+  server.on("/api/probe/start", HTTP_POST, [] {
+    if (!startTargetProbe()) {
+      sendJson(409, "{\"error\":\"probe already active, Wi-Fi is disconnected, or target configuration is invalid\"}");
       return;
     }
-    sendJson(202, lanStatusJson());
+    sendJson(202, probeStatusJson());
   });
-  server.on("/api/lan/scan/stop", HTTP_POST, [] {
-    stopLanScan();
-    sendJson(202, lanStatusJson());
+  server.on("/api/probe/stop", HTTP_POST, [] {
+    stopTargetProbe();
+    sendJson(202, probeStatusJson());
   });
-  server.on("/api/lan/scan/status", HTTP_GET, [] { sendJson(200, lanStatusJson()); });
-  server.on("/api/lan/scan/results", HTTP_GET, [] {
-    if (LittleFS.exists("/lan-scan.json") && !lanScan.active) {
-      File file = LittleFS.open("/lan-scan.json", FILE_READ);
+  server.on("/api/probe/status", HTTP_GET,
+            [] { sendJson(200, probeStatusJson()); });
+  server.on("/api/probe/results", HTTP_GET, [] {
+    if (LittleFS.exists("/rtk3-probe.json") && !probe.active) {
+      File file = LittleFS.open("/rtk3-probe.json", FILE_READ);
       server.streamFile(file, "application/json");
       file.close();
       return;
     }
-    sendJson(200, lanResultsJson());
+    sendJson(200, probeResultsJson());
   });
-  server.on("/api/probe", HTTP_POST, handleManualProbe);
   server.on("/api/wifi/scan", HTTP_POST, handleWifiScan);
   server.on("/api/wifi/configure", HTTP_POST, handleWifiConfigure);
   server.on("/api/wifi/clear", HTTP_POST, handleWifiClear);
@@ -588,10 +681,8 @@ void connectWifi() {
     delay(250);
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[wifi] station connected at %s, gateway %s, mask %s\n",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.gatewayIP().toString().c_str(),
-                  WiFi.subnetMask().toString().c_str());
+    Serial.printf("[wifi] station connected at %s\n",
+                  WiFi.localIP().toString().c_str());
   } else {
     Serial.println("[wifi] station connection failed, configure through fallback AP");
   }
@@ -602,15 +693,15 @@ void connectWifi() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\nRTK3 ESP32-S3 network probe starting");
+  Serial.println("\nRTK3 ESP32-S3 direct target probe starting");
 
   if (STATUS_LED_PIN >= 0) {
     pinMode(STATUS_LED_PIN, OUTPUT);
     setLed(false);
   }
   if (!LittleFS.begin(true)) Serial.println("[fatal] LittleFS mount failed");
-  scanMutex = xSemaphoreCreateMutex();
-  if (!scanMutex) Serial.println("[fatal] scan mutex allocation failed");
+  probeMutex = xSemaphoreCreateMutex();
+  if (!probeMutex) Serial.println("[fatal] probe mutex allocation failed");
 
   connectWifi();
   configureRoutes();
@@ -622,9 +713,9 @@ void setup() {
     Serial.printf("[mdns] http://%s.local/\n", DEVICE_HOSTNAME);
   }
 
-  if (AUTO_LAN_SCAN_ON_BOOT && WiFi.status() == WL_CONNECTED) {
+  if (AUTO_TARGET_PROBE_ON_BOOT && WiFi.status() == WL_CONNECTED) {
     delay(500);
-    startLanScan();
+    startTargetProbe();
   }
 }
 
