@@ -10,9 +10,15 @@
 #include <string.h>
 
 #include "TlsDiagnostics.h"
+#include "esp_netif.h"
+#include "esp_netif_net_stack.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/etharp.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
+#include "lwip/tcpip.h"
 #include "mbedtls/x509_crt.h"
 
 #if __has_include("secrets.h")
@@ -31,6 +37,7 @@ constexpr uint8_t kMaximumTcpAttempts = 3U;
 constexpr uint32_t kTcpRetryDelayMs = 250U;
 constexpr uint32_t kTcpSettleDelayMs = 750U;
 constexpr uint32_t kTlsAttemptDelayMs = 500U;
+constexpr uint32_t kArpReplyWaitMs = 500U;
 constexpr uint32_t kHandshakeTimeoutSeconds = 8U;
 constexpr const char* kEvidencePath = "/rtk3-tls-evidence.json";
 constexpr const char* kEvidenceTempPath = "/rtk3-tls-evidence.tmp";
@@ -179,6 +186,152 @@ String networkJson(const NetworkSnapshot& snapshot) {
   return json;
 }
 
+struct ArpLookupContext {
+  struct netif* interface = nullptr;
+  ip4_addr_t target{};
+  bool found = false;
+  uint8_t mac[6]{};
+  err_t requestResult = ERR_OK;
+};
+
+void findArpEntryInTcpipThread(void* argument) {
+  auto* context = static_cast<ArpLookupContext*>(argument);
+  struct eth_addr* ethernetAddress = nullptr;
+  const ip4_addr_t* matchedIp = nullptr;
+  context->found =
+      etharp_find_addr(context->interface, &context->target, &ethernetAddress,
+                       &matchedIp) >= 0 &&
+      ethernetAddress != nullptr;
+  if (context->found) {
+    memcpy(context->mac, ethernetAddress->addr, sizeof(context->mac));
+  }
+}
+
+void requestArpInTcpipThread(void* argument) {
+  auto* context = static_cast<ArpLookupContext*>(argument);
+  context->requestResult =
+      etharp_request(context->interface, &context->target);
+}
+
+bool runInTcpipThread(tcpip_callback_fn callback, void* context) {
+  return tcpip_callback_with_block(callback, context, 1) == ERR_OK;
+}
+
+String macAddressText(const uint8_t mac[6]) {
+  char buffer[18]{};
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],
+           mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buffer);
+}
+
+struct ArpEvidence {
+  bool eligible = false;
+  bool attempted = false;
+  bool resolved = false;
+  bool cacheHit = false;
+  int requestError = 0;
+  uint32_t durationMs = 0;
+  String mac;
+  String outcome;
+};
+
+ArpEvidence captureArpEvidence(const IPAddress& target,
+                               bool targetOnLocalSubnet) {
+  ArpEvidence evidence;
+  evidence.eligible = targetOnLocalSubnet;
+  const uint32_t started = millis();
+
+  if (!targetOnLocalSubnet) {
+    evidence.outcome = "not-local-subnet";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  esp_netif_t* station =
+      esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!station) {
+    evidence.outcome = "station-netif-unavailable";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  auto* interface =
+      static_cast<struct netif*>(esp_netif_get_netif_impl(station));
+  if (!interface) {
+    evidence.outcome = "lwip-netif-unavailable";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  ArpLookupContext context;
+  context.interface = interface;
+  IP4_ADDR(&context.target, target[0], target[1], target[2], target[3]);
+
+  if (!runInTcpipThread(findArpEntryInTcpipThread, &context)) {
+    evidence.outcome = "arp-cache-check-callback-failed";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  if (context.found) {
+    evidence.resolved = true;
+    evidence.cacheHit = true;
+    evidence.mac = macAddressText(context.mac);
+    evidence.outcome = "resolved-from-cache";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  evidence.attempted = true;
+  if (!runInTcpipThread(requestArpInTcpipThread, &context)) {
+    evidence.outcome = "arp-request-callback-failed";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  evidence.requestError = static_cast<int>(context.requestResult);
+  if (context.requestResult != ERR_OK) {
+    evidence.outcome = "arp-request-failed";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(kArpReplyWaitMs));
+  context.found = false;
+  if (!runInTcpipThread(findArpEntryInTcpipThread, &context)) {
+    evidence.outcome = "arp-result-callback-failed";
+    evidence.durationMs = millis() - started;
+    return evidence;
+  }
+
+  evidence.resolved = context.found;
+  if (evidence.resolved) {
+    evidence.mac = macAddressText(context.mac);
+    evidence.outcome = "resolved-after-request";
+  } else {
+    evidence.outcome = "no-arp-reply";
+  }
+  evidence.durationMs = millis() - started;
+  return evidence;
+}
+
+String arpEvidenceJson(const ArpEvidence& evidence) {
+  String json;
+  json.reserve(280 + evidence.mac.length() + evidence.outcome.length());
+  json += "{\"eligible\":" + String(evidence.eligible ? "true" : "false");
+  json += ",\"attempted\":" +
+          String(evidence.attempted ? "true" : "false");
+  json += ",\"resolved\":" +
+          String(evidence.resolved ? "true" : "false");
+  json += ",\"cacheHit\":" +
+          String(evidence.cacheHit ? "true" : "false");
+  json += ",\"requestError\":" + String(evidence.requestError);
+  json += ",\"durationMs\":" + String(evidence.durationMs);
+  json += ",\"mac\":\"" + jsonEscape(evidence.mac) + "\"";
+  json += ",\"outcome\":\"" + jsonEscape(evidence.outcome) + "\"}";
+  return json;
+}
+
 class InspectableSecureClient : public WiFiClientSecure {
  public:
   const char* negotiatedVersion() const {
@@ -238,19 +391,29 @@ String tcpAttemptJson(const TcpAttempt& result) {
 }
 
 String tcpDiagnosis(const TcpAttempt* attempts, uint8_t attemptsMade,
-                    bool tcpReachable, bool targetOnLocalSubnet) {
+                    bool tcpReachable, bool targetOnLocalSubnet,
+                    const ArpEvidence& arp) {
   if (tcpReachable) {
     return "TCP 8883 accepted a connection; remaining TCP retries were skipped and TLS probing was allowed after a settle delay";
   }
 
   for (uint8_t i = 0; i < attemptsMade; ++i) {
     if (attempts[i].errorCode == ECONNREFUSED) {
-      return "The target actively refused TCP 8883; the host may be reachable but the service is closed or rejecting connections";
+      return "The target actively refused TCP 8883; the host is reachable but the service is closed or rejecting connections";
     }
   }
 
+  if (arp.resolved) {
+    return "The target resolved by ARP at " + arp.mac +
+           "; the IP is present on the local link, but TCP 8883 is closed, filtered, or not listening";
+  }
+
+  if (targetOnLocalSubnet && arp.eligible && arp.attempted) {
+    return "The target produced no ARP reply on the local subnet; verify the RTK3 IP and power state, then check Wi-Fi client isolation or VLAN policy";
+  }
+
   if (targetOnLocalSubnet) {
-    return "TCP 8883 was unreachable on the local subnet; verify the RTK3 IP and power state, then check Wi-Fi client isolation, VLAN rules, or a device firewall";
+    return "TCP 8883 was unreachable on the local subnet and ARP evidence was unavailable; verify the RTK3 IP, power state, and network isolation";
   }
 
   return "TCP 8883 was unreachable across subnets; verify routing, VLAN rules, and firewall policy before interpreting TLS behavior";
@@ -415,7 +578,7 @@ bool saveEvidence(const String& json) {
 
 String errorJson(const String& error, const TargetSelection& target,
                  const String& trigger) {
-  String json = "{\"schemaVersion\":2,\"state\":\"error\"";
+  String json = "{\"schemaVersion\":3,\"state\":\"error\"";
   json += ",\"error\":\"" + jsonEscape(error) + "\"";
   json += ",\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
   json += ",\"targetSource\":\"" + jsonEscape(target.source) + "\"";
@@ -440,6 +603,8 @@ void tlsProbeTask(void*) {
   } else {
     const uint32_t started = millis();
     const NetworkSnapshot network = captureNetworkSnapshot(address);
+    const ArpEvidence arp =
+        captureArpEvidence(address, network.targetOnLocalSubnet);
     TcpAttempt tcpAttempts[kMaximumTcpAttempts];
     uint8_t tcpAttemptsMade = 0;
     bool tcpReachable = false;
@@ -466,15 +631,16 @@ void tlsProbeTask(void*) {
       ipSniMqtt = runTlsAttempt(address, target.ip, true, true);
     }
 
-    finalJson.reserve(4400 + noSni.certificateInfo.length() +
+    finalJson.reserve(4800 + noSni.certificateInfo.length() +
                       ipSniMqtt.certificateInfo.length());
-    finalJson = "{\"schemaVersion\":2,\"state\":\"completed\"";
+    finalJson = "{\"schemaVersion\":3,\"state\":\"completed\"";
     finalJson += ",\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
     finalJson += ",\"targetSource\":\"" + jsonEscape(target.source) + "\"";
     finalJson += ",\"port\":" + String(kTlsPort);
     finalJson += ",\"trigger\":\"" + jsonEscape(trigger) + "\"";
     finalJson += ",\"durationMs\":" + String(millis() - started);
     finalJson += ",\"network\":" + networkJson(network);
+    finalJson += ",\"arp\":" + arpEvidenceJson(arp);
     finalJson += ",\"tcpReachable\":" +
                  String(tcpReachable ? "true" : "false");
     finalJson += ",\"tcpAttemptsPlanned\":" +
@@ -495,7 +661,7 @@ void tlsProbeTask(void*) {
     finalJson += ",\"diagnosis\":\"" +
                  jsonEscape(tcpDiagnosis(tcpAttempts, tcpAttemptsMade,
                                          tcpReachable,
-                                         network.targetOnLocalSubnet)) +
+                                         network.targetOnLocalSubnet, arp)) +
                  "\"";
     finalJson += ",\"attempts\":[";
     if (tcpReachable) {
@@ -527,7 +693,7 @@ bool startTlsProbe(const char* trigger) {
   }
   tlsProbeActive = true;
   tlsProbeTrigger = trigger ? trigger : "unknown";
-  tlsEvidence = "{\"schemaVersion\":2,\"state\":\"running\"}";
+  tlsEvidence = "{\"schemaVersion\":3,\"state\":\"running\"}";
   xSemaphoreGive(tlsMutex);
 
   LittleFS.remove(kEvidencePath);
@@ -539,7 +705,7 @@ bool startTlsProbe(const char* trigger) {
     tlsProbeActive = false;
     tlsTask = nullptr;
     tlsEvidence =
-        "{\"schemaVersion\":2,\"state\":\"error\",\"error\":\"task creation failed\"}";
+        "{\"schemaVersion\":3,\"state\":\"error\",\"error\":\"task creation failed\"}";
     xSemaphoreGive(tlsMutex);
     return false;
   }
@@ -547,7 +713,7 @@ bool startTlsProbe(const char* trigger) {
 }
 
 String currentEvidence() {
-  if (!tlsMutex) return "{\"schemaVersion\":2,\"state\":\"initializing\"}";
+  if (!tlsMutex) return "{\"schemaVersion\":3,\"state\":\"initializing\"}";
 
   xSemaphoreTake(tlsMutex, portMAX_DELAY);
   const String copy = tlsEvidence;
@@ -596,7 +762,7 @@ void initializeTlsEvidenceServer() {
 
     const bool started = startTlsProbe("manual-http");
     tlsServer.send(started ? 202 : 409, "application/json",
-                   started ? "{\"schemaVersion\":2,\"state\":\"started\"}"
+                   started ? "{\"schemaVersion\":3,\"state\":\"started\"}"
                            : "{\"error\":\"probe active or Wi-Fi disconnected\"}");
   });
   tlsServer.onNotFound([] {
