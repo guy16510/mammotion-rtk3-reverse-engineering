@@ -1,46 +1,36 @@
-# Mammotion RTK3 ESP32-S3 network probe
+# Mammotion RTK3 ESP32-S3 direct probe
 
-Standalone ESP32-S3 firmware for finding and probing a Mammotion RTK3 that is already connected to your home Wi-Fi.
+Standalone ESP32-S3 firmware for probing one known Mammotion RTK3 on your home network.
 
-No Raspberry Pi, always-on Mac, UART wiring, USB serial adapter, Node.js service, or manually entered RTK IP is required after the ESP32-S3 is flashed.
+You provide the RTK3 IP address and LoRa ID once. The ESP32 stores them, connects directly to that IP, and repeats a bounded evidence-gathering probe without scanning the rest of your network.
+
+No Raspberry Pi, always-on Mac, UART wiring, subnet discovery, power-cycle comparison, Node.js service, or manually repeated target entry is required after setup.
 
 ## What it does
 
 - Joins your home Wi-Fi
-- Automatically determines its local IPv4 subnet
-- Starts a bounded LAN scan after boot
-- Pings local devices with a short timeout
-- Checks likely embedded, MQTT, web, diagnostic, and Mammotion-related TCP ports
-- Ranks likely IoT and Mammotion candidates
-- Saves scan results in ESP32 flash
-- Compares consecutive scans and reports devices that disappeared
-- Provides a browser interface and JSON API
-- Provides a fallback access point for entering or changing Wi-Fi credentials
-- Restricts all automatic and manual probing to private IPv4 networks
+- Stores one RTK3 private IPv4 address
+- Stores the RTK3 LoRa identifier
+- Automatically probes the configured RTK3 after boot
+- Sends one ICMP reachability check
+- Checks a bounded list of likely TCP ports
+- Records TCP connection latency
+- Reads passive service banners when a service sends one
+- Sends `GET /` only on common plaintext HTTP ports
+- Searches returned evidence for the configured LoRa ID
+- Saves the latest result to ESP32 flash
+- Exposes a browser interface and JSON API
+- Keeps a fallback access point available for configuration
 
-The strongest practical identification workflow is:
+It does not scan every IP on the LAN, connect to UART, write firmware, expose a shell, or probe public addresses.
 
-1. Scan with the RTK3 powered on.
-2. Power the RTK3 off.
-3. Scan again.
-4. Check `missingSinceLastScan`.
+## Default ports
 
-The IP that disappeared is the strongest RTK3 candidate.
+```text
+22,53,80,443,554,123,1883,2101,5000,5001,5353,8000,8080,8443,8883,9000,10000,50001,50002,50003
+```
 
-## Important network limitation
-
-The ESP32-S3 can discover hosts, ping them, and test local TCP services.
-
-A normal Wi-Fi client cannot decrypt another client's WPA-protected unicast traffic. Capturing the RTK3's cloud traffic requires router-side packet capture, port mirroring, or a separate monitor-mode workflow. This firmware does not pretend otherwise.
-
-## Hardware
-
-- ESP32-S3 development board
-- Data-capable USB cable
-
-The default PlatformIO target is `esp32-s3-devkitc-1`. Change the board in `platformio.ini` if your board uses a different PlatformIO definition.
-
-No connection to the RTK3 is required.
+The list can be edited from the browser before running a probe.
 
 ## Build and flash from macOS
 
@@ -62,9 +52,9 @@ pio device list
 pio run -e esp32-s3-devkitc-1 -t upload --upload-port /dev/cu.usbmodemXXXX
 ```
 
-## First boot and Wi-Fi setup
+## One-time setup
 
-The ESP32-S3 always creates a fallback access point:
+The ESP32 always creates a fallback access point:
 
 ```text
 SSID: RTK3-Probe
@@ -74,106 +64,87 @@ URL: http://192.168.4.1/
 
 1. Connect your phone or Mac to `RTK3-Probe`.
 2. Open `http://192.168.4.1/`.
-3. Enter your home Wi-Fi SSID and password.
-4. Select **Save and restart**.
-5. Reconnect your phone or Mac to your normal home Wi-Fi.
-6. Open `http://rtk3-probe.local/`.
+3. Enter your home Wi-Fi credentials.
+4. Enter the known RTK3 IP address.
+5. Enter the RTK3 LoRa ID.
+6. Save the target.
+7. Save Wi-Fi and allow the ESP32 to restart.
+8. Reconnect to your normal home Wi-Fi.
+9. Open `http://rtk3-probe.local/`.
 
-The serial monitor also prints the ESP32's assigned home-network IP address.
+The ESP32 automatically probes the saved RTK3 after joining Wi-Fi. Select **Probe RTK3 now** to repeat it.
 
-You may alternatively compile credentials into `include/secrets.h`, but it is no longer required.
+You can alternatively place compile-time defaults in `include/secrets.h`:
 
-## Automatic discovery
+```cpp
+#define WIFI_SSID "your-home-wifi"
+#define WIFI_PASSWORD "your-password"
+#define RTK3_IP "192.168.1.123"
+#define RTK3_LORA_ID "your-lora-id"
+```
 
-Once the ESP32 joins your home network, it automatically scans the subnet.
-
-The scanner:
-
-- Uses the ESP32's assigned IP and subnet mask
-- Caps unexpectedly large networks to the ESP32's local `/24`
-- Probes at most 254 host addresses
-- Uses short ICMP and TCP timeouts
-- Runs in a background task so the web interface remains responsive
-- Saves final results to `/lan-scan.json`
-
-Likely candidates are ranked using reachable services. Ports `50001-50003` receive a strong Mammotion heuristic score, while MQTT ports `1883` and `8883` receive a weaker IoT score. This ranking is a lead, not proof.
-
-## Browser workflow
-
-Open the device page and use:
-
-- **Scan my network** to start another scan
-- **Show ranked results** to inspect discovered devices
-- **Stop** to cancel a scan
-- **Probe** to test a known private IP and selected ports
-
-For reliable identification, use the power-cycle comparison instead of trusting a port heuristic alone.
+Runtime values saved from the browser override compile-time defaults.
 
 ## Result example
 
 ```json
 {
   "completed": true,
-  "localIp": "192.168.1.42",
-  "gateway": "192.168.1.1",
-  "hosts": [
+  "targetIp": "192.168.1.123",
+  "loraId": "1234567890",
+  "ping": true,
+  "rttMs": 4,
+  "loraObserved": false,
+  "durationMs": 5160,
+  "ports": [
     {
-      "ip": "192.168.1.123",
-      "ping": true,
-      "rttMs": 4,
-      "gateway": false,
-      "newSinceLastScan": false,
-      "score": 75,
-      "classification": "strong-mammotion-candidate",
-      "openPorts": [50001]
+      "port": 80,
+      "open": true,
+      "connectMs": 8,
+      "receivedBytes": 182,
+      "loraMatch": false,
+      "evidence": "HTTP/1.1 200 OK..."
     }
-  ],
-  "missingSinceLastScan": []
+  ]
 }
 ```
 
-## HTTP endpoints
+`loraObserved: true` is strong evidence that a returned local service exposes the configured LoRa identifier. `false` does not mean the IP is wrong. The device may not expose the identifier through an inbound plaintext service.
+
+## Browser and API
 
 ```text
 GET  /healthz
 GET  /api/status
-POST /api/lan/scan/start
-POST /api/lan/scan/stop
-GET  /api/lan/scan/status
-GET  /api/lan/scan/results
-POST /api/probe?ip=192.168.1.123&ports=80,443,1883,8883,50001,50002,50003
+GET  /api/config
+POST /api/config
+POST /api/config/clear
+POST /api/probe/start
+POST /api/probe/stop
+GET  /api/probe/status
+GET  /api/probe/results
 POST /api/wifi/scan
 POST /api/wifi/configure
 POST /api/wifi/clear
 ```
 
-Manual probing accepts only private IPv4 addresses and a bounded number of unique ports.
+Target configuration uses form fields:
 
-## Validation
-
-GitHub Actions runs:
-
-```bash
-pio test -e native
-pio run -e esp32-s3-devkitc-1
+```text
+ip=<private IPv4>
+loraId=<LoRa identifier>
+ports=<comma-separated TCP ports>
 ```
 
-The current network-first firmware compiles successfully for the generic ESP32-S3 DevKitC target. The existing portable protocol tests also remain green.
+## Honest limitations
 
-Hardware validation still requires your actual ESP32-S3 and home network. Specifically, the build cannot prove that your access point permits client-to-client traffic, that the RTK3 answers ICMP, or that it exposes an inbound TCP service.
-
-## If the RTK3 does not appear
-
-Possible reasons:
-
-- Your Wi-Fi network has client isolation enabled
-- The RTK3 is on a guest network or different VLAN
-- The ESP32 is on a different subnet
-- The RTK3 ignores ICMP and exposes no tested inbound TCP ports
-- The RTK3 communicates only through outbound cloud connections
-
-The next escalation is router-side evidence, such as DHCP leases, ARP tables, DNS logs, firewall logs, or packet capture. That is more reliable than attempting to sniff encrypted traffic from another Wi-Fi client.
+- The ESP32 can only inspect services the RTK3 exposes to the local network.
+- A closed port does not prove the RTK3 is offline.
+- The LoRa ID may never appear in local plaintext responses.
+- A normal Wi-Fi client cannot decrypt another client's WPA-protected cloud traffic.
+- If the RTK3 communicates only outbound to Mammotion cloud services, the next useful evidence source is your router, DNS logs, firewall logs, or access-point packet capture.
+- The first real run still requires your ESP32-S3, RTK3 IP, LoRa ID, and home network.
 
 ## Safety and privacy
 
-Scan output can contain local IP addresses, Wi-Fi names, and device metadata. Review results before publishing them. Probe only networks and equipment you own or are authorized to test.
+Only private IPv4 targets are accepted. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, identifiers, and service responses, so review them before publishing.
