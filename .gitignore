@@ -6,9 +6,13 @@ include/secrets.h
 *.map
 .DS_Store
 
+# Local environment and credential files
+.env
+.env.*
+!.env.example
+
 # Legacy host-capture artifacts
 node_modules/
-.env
 rtk3-captures/
 *.pcap
 *.pcapng
