@@ -40,14 +40,22 @@ The general port probe and the TLS evidence probe do not run concurrently.
 
 The TLS probe waits until `/rtk3-probe.json` exists, which indicates the main bounded probe completed. If the main probe cannot produce that file, the TLS probe uses a 45-second fallback delay. A manual TLS request made during that initial window returns HTTP 409 instead of competing with the main probe.
 
-Before any TLS handshake, the firmware makes three independent raw TCP connections to port 8883. The result includes:
+Before any TLS handshake, the firmware makes up to three independent raw TCP connection attempts to port 8883. It stops immediately after the first successful connection, waits briefly for the service to settle, and only then begins TLS. This avoids opening five rapid connections against a small embedded service and accidentally triggering connection limits or rate limiting.
 
+The result includes:
+
+- Schema version for machine-readable result changes
 - Target source, either saved NVS configuration or compile-time default
+- Private-address validation for both runtime and compile-time targets
 - ESP32 SSID, BSSID, IP, subnet mask, gateway, DNS, RSSI, and Wi-Fi channel
 - Whether the target appears to be on the ESP32 local subnet
+- Planned and actual TCP attempt counts
 - Per-attempt TCP timing, errno value, errno text, and classified outcome
 - A bounded diagnosis for timeout, refusal, host routing, or subnet isolation cases
-- TLS evidence only when at least one independent TCP preflight succeeds
+- TLS evidence only when an independent TCP preflight succeeds
+- Atomic LittleFS result publication through a temporary file and rename
+
+The automatic TLS probe is marked complete only after its task starts successfully. A transient Wi-Fi disconnect at the trigger point therefore does not permanently suppress the boot-time probe.
 
 The TLS endpoint is served separately on port 81:
 
@@ -115,7 +123,7 @@ You can alternatively place compile-time defaults in `include/secrets.h`:
 #define RTK3_LORA_ID "your-lora-id"
 ```
 
-Runtime values saved from the browser override compile-time defaults for both the general probe and the TLS evidence probe.
+Runtime values saved from the browser override compile-time defaults for both the general probe and the TLS evidence probe. Both paths reject targets outside the allowed private IPv4 ranges.
 
 ## General result example
 
@@ -147,6 +155,7 @@ Runtime values saved from the browser override compile-time defaults for both th
 
 ```json
 {
+  "schemaVersion": 2,
   "state": "completed",
   "targetIp": "192.168.2.26",
   "targetSource": "nvs",
@@ -158,6 +167,9 @@ Runtime values saved from the browser override compile-time defaults for both th
     "targetOnLocalSubnet": true
   },
   "tcpReachable": false,
+  "tcpAttemptsPlanned": 3,
+  "tcpAttemptsMade": 3,
+  "tcpStoppedAfterSuccess": false,
   "tcpAttempts": [
     {
       "attempt": 1,
@@ -175,6 +187,8 @@ Runtime values saved from the browser override compile-time defaults for both th
 ```
 
 When `tcpReachable` is false, an empty TLS `attempts` array is intentional. It prevents a TCP routing or isolation failure from being mislabeled as a TLS or MQTT authentication failure.
+
+When `tcpReachable` is true, `tcpAttemptsMade` may be less than `tcpAttemptsPlanned`. That means the preflight succeeded and the remaining connection attempts were deliberately skipped before TLS began.
 
 ## Browser and API
 
@@ -201,6 +215,15 @@ loraId=<LoRa identifier>
 ports=<comma-separated TCP ports>
 ```
 
+## Native tests
+
+The native PlatformIO environment covers both the RTK protocol parser and the platform-independent TLS diagnostic decisions:
+
+- Allowed and rejected IPv4 ranges
+- Subnet comparison
+- TCP errno classification
+- Retry termination after a successful TCP preflight
+
 ## Honest limitations
 
 - The ESP32 can only inspect services the RTK3 exposes to the local network.
@@ -214,4 +237,4 @@ ports=<comma-separated TCP ports>
 
 ## Safety and privacy
 
-Only private IPv4 targets are accepted by the main configuration API. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, identifiers, Wi-Fi metadata, and service responses, so review them before publishing.
+Only private IPv4 targets are accepted by the main configuration API and the TLS evidence task. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, identifiers, Wi-Fi metadata, and service responses, so review them before publishing.
