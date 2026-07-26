@@ -18,6 +18,7 @@ No Raspberry Pi, always-on Mac, UART wiring, subnet discovery, power-cycle compa
 - Reads passive service banners when a service sends one
 - Sends `GET /` only on common plaintext HTTP ports
 - Searches returned evidence for the configured LoRa ID
+- Performs a target-only ARP lookup when the RTK3 is on the local subnet
 - Performs a separate bounded TCP 8883 preflight before attempting TLS
 - Captures TLS version, cipher, ALPN, certificate metadata, and handshake errors when TCP 8883 is reachable
 - Saves the latest results to ESP32 flash
@@ -40,6 +41,13 @@ The general port probe and the TLS evidence probe do not run concurrently.
 
 The TLS probe waits until `/rtk3-probe.json` exists, which indicates the main bounded probe completed. If the main probe cannot produce that file, the TLS probe uses a 45-second fallback delay. A manual TLS request made during that initial window returns HTTP 409 instead of competing with the main probe.
 
+When the configured RTK3 is on the ESP32 local subnet, the firmware first checks the existing ARP cache and then sends one ARP request only to the configured target if needed. The ARP operation runs through the lwIP TCP/IP thread rather than directly from the evidence task. It does not enumerate the ARP table or scan other addresses.
+
+ARP evidence separates two materially different failures:
+
+- `resolved: true` proves that a device at the configured IP answered at Ethernet/Wi-Fi link layer, even if ICMP and TCP are blocked.
+- `outcome: no-arp-reply` means the target IP did not resolve locally during the bounded check, which points toward a wrong IP, powered-off device, client isolation, or VLAN policy.
+
 Before any TLS handshake, the firmware makes up to three independent raw TCP connection attempts to port 8883. It stops immediately after the first successful connection, waits briefly for the service to settle, and only then begins TLS. This avoids opening five rapid connections against a small embedded service and accidentally triggering connection limits or rate limiting.
 
 The result includes:
@@ -49,11 +57,12 @@ The result includes:
 - Private-address validation for both runtime and compile-time targets
 - ESP32 SSID, BSSID, IP, subnet mask, gateway, DNS, RSSI, and Wi-Fi channel
 - Whether the target appears to be on the ESP32 local subnet
+- Target-only ARP eligibility, request status, resolution result, and MAC address
 - Planned and actual TCP attempt counts
 - Per-attempt TCP timing, errno value, errno text, and classified outcome
-- A bounded diagnosis for timeout, refusal, host routing, or subnet isolation cases
+- A bounded diagnosis combining ARP and TCP evidence
 - TLS evidence only when an independent TCP preflight succeeds
-- Atomic LittleFS result publication through a temporary file and rename
+- LittleFS result publication through a temporary file and rename
 
 The automatic TLS probe is marked complete only after its task starts successfully. A transient Wi-Fi disconnect at the trigger point therefore does not permanently suppress the boot-time probe.
 
@@ -155,7 +164,7 @@ Runtime values saved from the browser override compile-time defaults for both th
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "state": "completed",
   "targetIp": "192.168.2.26",
   "targetSource": "nvs",
@@ -165,6 +174,16 @@ Runtime values saved from the browser override compile-time defaults for both th
     "localIp": "192.168.2.43",
     "subnetMask": "255.255.255.0",
     "targetOnLocalSubnet": true
+  },
+  "arp": {
+    "eligible": true,
+    "attempted": true,
+    "resolved": true,
+    "cacheHit": false,
+    "requestError": 0,
+    "durationMs": 501,
+    "mac": "C0:F5:35:CF:70:11",
+    "outcome": "resolved-after-request"
   },
   "tcpReachable": false,
   "tcpAttemptsPlanned": 3,
@@ -181,7 +200,7 @@ Runtime values saved from the browser override compile-time defaults for both th
     }
   ],
   "tlsAttempted": false,
-  "diagnosis": "TCP 8883 was unreachable on the local subnet...",
+  "diagnosis": "The target resolved by ARP at C0:F5:35:CF:70:11; the IP is present on the local link, but TCP 8883 is closed, filtered, or not listening",
   "attempts": []
 }
 ```
@@ -189,6 +208,8 @@ Runtime values saved from the browser override compile-time defaults for both th
 When `tcpReachable` is false, an empty TLS `attempts` array is intentional. It prevents a TCP routing or isolation failure from being mislabeled as a TLS or MQTT authentication failure.
 
 When `tcpReachable` is true, `tcpAttemptsMade` may be less than `tcpAttemptsPlanned`. That means the preflight succeeded and the remaining connection attempts were deliberately skipped before TLS began.
+
+The ARP MAC address can be compared with the router client list. A match is strong evidence that the configured IP belongs to the expected physical device. A MAC vendor label alone is not definitive device identity because embedded manufacturers commonly reuse third-party Wi-Fi modules.
 
 ## Browser and API
 
@@ -229,12 +250,14 @@ The native PlatformIO environment covers both the RTK protocol parser and the pl
 - The ESP32 can only inspect services the RTK3 exposes to the local network.
 - A closed or filtered port does not prove the RTK3 is offline.
 - ICMP may be blocked even when a TCP service is available.
+- ARP applies only to a target on the ESP32 local subnet.
+- A missing ARP response can also be caused by Wi-Fi client isolation or VLAN policy, not only a wrong IP or powered-off device.
 - The LoRa ID may never appear in local plaintext responses.
 - A normal Wi-Fi client cannot decrypt another client's WPA-protected cloud traffic.
-- TCP timeout errno values depend on the ESP32 networking stack and should be interpreted with the timing and network snapshot, not alone.
+- TCP timeout errno values depend on the ESP32 networking stack and should be interpreted with the timing, ARP evidence, and network snapshot, not alone.
 - If the RTK3 communicates only outbound to Mammotion cloud services, the next useful evidence source is your router, DNS logs, firewall logs, or access-point packet capture.
 - The first real run still requires your ESP32-S3, RTK3 IP, LoRa ID, and home network.
 
 ## Safety and privacy
 
-Only private IPv4 targets are accepted by the main configuration API and the TLS evidence task. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, identifiers, Wi-Fi metadata, and service responses, so review them before publishing.
+Only the configured private IPv4 target is checked. The ARP operation sends at most one request to that target and does not enumerate or scan the subnet. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, MAC addresses, identifiers, Wi-Fi metadata, and service responses, so review them before publishing.
