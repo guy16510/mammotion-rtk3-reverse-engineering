@@ -1,0 +1,32 @@
+name: ESP32-S3 firmware
+
+on:
+  push:
+    branches:
+      - main
+      - codex/esp32-s3-standalone-probe
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install PlatformIO
+        run: pip install platformio==6.1.18
+      - name: Run native parser tests
+        run: pio test -e native
+      - name: Build ESP32-S3 firmware
+        run: pio run -e esp32-s3-devkitc-1
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtk3-probe-esp32-s3
+          path: |
+            .pio/build/esp32-s3-devkitc-1/firmware.bin
+            .pio/build/esp32-s3-devkitc-1/bootloader.bin
+            .pio/build/esp32-s3-devkitc-1/partitions.bin
