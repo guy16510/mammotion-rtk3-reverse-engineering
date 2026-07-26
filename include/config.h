@@ -32,8 +32,10 @@
 #define MAX_CAPTURE_SECONDS_PER_BAUD 60
 #endif
 
+// Eight baud samples at 64 KiB each fit comfortably in the default LittleFS
+// partition. Increase only after selecting a larger filesystem partition or SD.
 #ifndef MAX_CAPTURE_BYTES_PER_BAUD
-#define MAX_CAPTURE_BYTES_PER_BAUD (512U * 1024U)
+#define MAX_CAPTURE_BYTES_PER_BAUD (64U * 1024U)
 #endif
 
 #ifndef MAX_PROBE_PORTS
