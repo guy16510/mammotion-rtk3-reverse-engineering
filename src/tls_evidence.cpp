@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <string.h>
 
+#include "TlsDiagnostics.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -26,10 +27,13 @@ constexpr uint16_t kTlsPort = 8883;
 constexpr uint32_t kFallbackAutoStartAfterMs = 45000U;
 constexpr uint32_t kTcpConnectTimeoutMs = 1500U;
 constexpr uint32_t kTlsConnectTimeoutMs = 6000U;
-constexpr uint8_t kTcpAttemptCount = 3U;
+constexpr uint8_t kMaximumTcpAttempts = 3U;
 constexpr uint32_t kTcpRetryDelayMs = 250U;
+constexpr uint32_t kTcpSettleDelayMs = 750U;
+constexpr uint32_t kTlsAttemptDelayMs = 500U;
 constexpr uint32_t kHandshakeTimeoutSeconds = 8U;
 constexpr const char* kEvidencePath = "/rtk3-tls-evidence.json";
+constexpr const char* kEvidenceTempPath = "/rtk3-tls-evidence.tmp";
 constexpr const char* kMainProbeEvidencePath = "/rtk3-probe.json";
 
 WebServer tlsServer(81);
@@ -47,11 +51,21 @@ String jsonEscape(const String& value) {
   for (size_t i = 0; i < value.length(); ++i) {
     const char c = value[i];
     switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
       default:
         if (static_cast<uint8_t>(c) >= 0x20) out += c;
         break;
@@ -86,10 +100,13 @@ String x509Time(const mbedtls_x509_time& value) {
 }
 
 uint32_t ipv4Value(const IPAddress& address) {
-  return (static_cast<uint32_t>(address[0]) << 24U) |
-         (static_cast<uint32_t>(address[1]) << 16U) |
-         (static_cast<uint32_t>(address[2]) << 8U) |
-         static_cast<uint32_t>(address[3]);
+  return TlsDiagnostics::ipv4Value(address[0], address[1], address[2],
+                                   address[3]);
+}
+
+bool isAllowedTarget(const IPAddress& address) {
+  return TlsDiagnostics::isAllowedPrivateIpv4(
+      address[0], address[1], address[2], address[3]);
 }
 
 struct TargetSelection {
@@ -141,9 +158,8 @@ NetworkSnapshot captureNetworkSnapshot(const IPAddress& target) {
   snapshot.dnsIp = WiFi.dnsIP().toString();
   snapshot.rssi = WiFi.RSSI();
   snapshot.channel = WiFi.channel();
-  snapshot.targetOnLocalSubnet =
-      (ipv4Value(local) & ipv4Value(mask)) ==
-      (ipv4Value(target) & ipv4Value(mask));
+  snapshot.targetOnLocalSubnet = TlsDiagnostics::sameSubnet(
+      ipv4Value(local), ipv4Value(target), ipv4Value(mask));
   return snapshot;
 }
 
@@ -187,17 +203,6 @@ struct TcpAttempt {
   String outcome;
 };
 
-String classifyTcpFailure(int errorCode) {
-  switch (errorCode) {
-    case ETIMEDOUT: return "timeout";
-    case ECONNREFUSED: return "connection-refused";
-    case EHOSTUNREACH: return "host-unreachable";
-    case ENETUNREACH: return "network-unreachable";
-    case EADDRNOTAVAIL: return "address-not-available";
-    default: return errorCode == 0 ? "connect-failed-no-errno" : "connect-failed";
-  }
-}
-
 TcpAttempt runTcpAttempt(const IPAddress& address, uint8_t attemptNumber) {
   TcpAttempt result;
   result.attempt = attemptNumber;
@@ -210,7 +215,9 @@ TcpAttempt runTcpAttempt(const IPAddress& address, uint8_t attemptNumber) {
   result.connectMs = millis() - started;
   result.errorCode = result.connected ? 0 : errno;
   result.outcome =
-      result.connected ? "tcp-connected" : classifyTcpFailure(result.errorCode);
+      result.connected
+          ? "tcp-connected"
+          : TlsDiagnostics::classifyTcpFailure(result.errorCode);
   if (!result.connected && result.errorCode != 0) {
     result.errorText = strerror(result.errorCode);
   }
@@ -230,14 +237,13 @@ String tcpAttemptJson(const TcpAttempt& result) {
   return json;
 }
 
-String tcpDiagnosis(const TcpAttempt attempts[kTcpAttemptCount],
-                    bool tcpReachable,
-                    bool targetOnLocalSubnet) {
+String tcpDiagnosis(const TcpAttempt* attempts, uint8_t attemptsMade,
+                    bool tcpReachable, bool targetOnLocalSubnet) {
   if (tcpReachable) {
-    return "TCP 8883 accepted at least one independent connection; TLS probing was allowed";
+    return "TCP 8883 accepted a connection; remaining TCP retries were skipped and TLS probing was allowed after a settle delay";
   }
 
-  for (uint8_t i = 0; i < kTcpAttemptCount; ++i) {
+  for (uint8_t i = 0; i < attemptsMade; ++i) {
     if (attempts[i].errorCode == ECONNREFUSED) {
       return "The target actively refused TCP 8883; the host may be reachable but the service is closed or rejecting connections";
     }
@@ -379,14 +385,42 @@ String tlsAttemptJson(const TlsAttempt& result) {
   return json;
 }
 
-void saveEvidence(const String& json) {
-  File file = LittleFS.open(kEvidencePath, FILE_WRITE);
+bool saveEvidence(const String& json) {
+  LittleFS.remove(kEvidenceTempPath);
+  File file = LittleFS.open(kEvidenceTempPath, FILE_WRITE);
   if (!file) {
-    Serial.println("[tls-evidence] unable to write evidence file");
-    return;
+    Serial.println("[tls-evidence] unable to create temporary evidence file");
+    return false;
   }
-  file.print(json);
+
+  const size_t written = file.print(json);
+  file.flush();
   file.close();
+  if (written != json.length()) {
+    LittleFS.remove(kEvidenceTempPath);
+    Serial.printf("[tls-evidence] short evidence write: %u of %u bytes\n",
+                  static_cast<unsigned>(written),
+                  static_cast<unsigned>(json.length()));
+    return false;
+  }
+
+  LittleFS.remove(kEvidencePath);
+  if (!LittleFS.rename(kEvidenceTempPath, kEvidencePath)) {
+    LittleFS.remove(kEvidenceTempPath);
+    Serial.println("[tls-evidence] unable to atomically publish evidence file");
+    return false;
+  }
+  return true;
+}
+
+String errorJson(const String& error, const TargetSelection& target,
+                 const String& trigger) {
+  String json = "{\"schemaVersion\":2,\"state\":\"error\"";
+  json += ",\"error\":\"" + jsonEscape(error) + "\"";
+  json += ",\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
+  json += ",\"targetSource\":\"" + jsonEscape(target.source) + "\"";
+  json += ",\"trigger\":\"" + jsonEscape(trigger) + "\"}";
+  return json;
 }
 
 void tlsProbeTask(void*) {
@@ -399,33 +433,42 @@ void tlsProbeTask(void*) {
   IPAddress address;
   String finalJson;
   if (!address.fromString(target.ip)) {
-    finalJson = "{\"state\":\"error\",\"error\":\"invalid RTK3 target IP\"";
-    finalJson += ",\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
-    finalJson += ",\"targetSource\":\"" + jsonEscape(target.source) + "\"}";
+    finalJson = errorJson("invalid RTK3 target IP", target, trigger);
+  } else if (!isAllowedTarget(address)) {
+    finalJson =
+        errorJson("RTK3 target must be a private IPv4 address", target, trigger);
   } else {
     const uint32_t started = millis();
     const NetworkSnapshot network = captureNetworkSnapshot(address);
-    TcpAttempt tcpAttempts[kTcpAttemptCount];
+    TcpAttempt tcpAttempts[kMaximumTcpAttempts];
+    uint8_t tcpAttemptsMade = 0;
     bool tcpReachable = false;
 
-    for (uint8_t i = 0; i < kTcpAttemptCount; ++i) {
-      tcpAttempts[i] = runTcpAttempt(address, i + 1U);
-      tcpReachable = tcpReachable || tcpAttempts[i].connected;
-      if (i + 1U < kTcpAttemptCount) {
+    do {
+      tcpAttempts[tcpAttemptsMade] =
+          runTcpAttempt(address, tcpAttemptsMade + 1U);
+      tcpReachable = tcpAttempts[tcpAttemptsMade].connected;
+      ++tcpAttemptsMade;
+
+      if (TlsDiagnostics::shouldRetryTcp(
+              tcpReachable, tcpAttemptsMade, kMaximumTcpAttempts)) {
         vTaskDelay(pdMS_TO_TICKS(kTcpRetryDelayMs));
       }
-    }
+    } while (TlsDiagnostics::shouldRetryTcp(
+        tcpReachable, tcpAttemptsMade, kMaximumTcpAttempts));
 
     TlsAttempt noSni;
     TlsAttempt ipSniMqtt;
     if (tcpReachable) {
+      vTaskDelay(pdMS_TO_TICKS(kTcpSettleDelayMs));
       noSni = runTlsAttempt(address, target.ip, false, false);
+      vTaskDelay(pdMS_TO_TICKS(kTlsAttemptDelayMs));
       ipSniMqtt = runTlsAttempt(address, target.ip, true, true);
     }
 
-    finalJson.reserve(4200 + noSni.certificateInfo.length() +
+    finalJson.reserve(4400 + noSni.certificateInfo.length() +
                       ipSniMqtt.certificateInfo.length());
-    finalJson = "{\"state\":\"completed\"";
+    finalJson = "{\"schemaVersion\":2,\"state\":\"completed\"";
     finalJson += ",\"targetIp\":\"" + jsonEscape(target.ip) + "\"";
     finalJson += ",\"targetSource\":\"" + jsonEscape(target.source) + "\"";
     finalJson += ",\"port\":" + String(kTlsPort);
@@ -434,8 +477,15 @@ void tlsProbeTask(void*) {
     finalJson += ",\"network\":" + networkJson(network);
     finalJson += ",\"tcpReachable\":" +
                  String(tcpReachable ? "true" : "false");
+    finalJson += ",\"tcpAttemptsPlanned\":" +
+                 String(kMaximumTcpAttempts);
+    finalJson += ",\"tcpAttemptsMade\":" + String(tcpAttemptsMade);
+    finalJson += ",\"tcpStoppedAfterSuccess\":" +
+                 String(tcpReachable && tcpAttemptsMade < kMaximumTcpAttempts
+                            ? "true"
+                            : "false");
     finalJson += ",\"tcpAttempts\":[";
-    for (uint8_t i = 0; i < kTcpAttemptCount; ++i) {
+    for (uint8_t i = 0; i < tcpAttemptsMade; ++i) {
       if (i) finalJson += ',';
       finalJson += tcpAttemptJson(tcpAttempts[i]);
     }
@@ -443,7 +493,8 @@ void tlsProbeTask(void*) {
     finalJson += ",\"tlsAttempted\":" +
                  String(tcpReachable ? "true" : "false");
     finalJson += ",\"diagnosis\":\"" +
-                 jsonEscape(tcpDiagnosis(tcpAttempts, tcpReachable,
+                 jsonEscape(tcpDiagnosis(tcpAttempts, tcpAttemptsMade,
+                                         tcpReachable,
                                          network.targetOnLocalSubnet)) +
                  "\"";
     finalJson += ",\"attempts\":[";
@@ -458,9 +509,10 @@ void tlsProbeTask(void*) {
   tlsProbeActive = false;
   tlsTask = nullptr;
   xSemaphoreGive(tlsMutex);
-  saveEvidence(finalJson);
 
-  Serial.println("[tls-evidence] probe complete");
+  const bool persisted = saveEvidence(finalJson);
+  Serial.printf("[tls-evidence] probe complete, persisted=%s\n",
+                persisted ? "true" : "false");
   Serial.println(finalJson);
   vTaskDelete(nullptr);
 }
@@ -475,10 +527,11 @@ bool startTlsProbe(const char* trigger) {
   }
   tlsProbeActive = true;
   tlsProbeTrigger = trigger ? trigger : "unknown";
-  tlsEvidence = "{\"state\":\"running\"}";
+  tlsEvidence = "{\"schemaVersion\":2,\"state\":\"running\"}";
   xSemaphoreGive(tlsMutex);
 
   LittleFS.remove(kEvidencePath);
+  LittleFS.remove(kEvidenceTempPath);
   const BaseType_t created =
       xTaskCreate(tlsProbeTask, "tls-evidence", 18432, nullptr, 1, &tlsTask);
   if (created != pdPASS) {
@@ -486,7 +539,7 @@ bool startTlsProbe(const char* trigger) {
     tlsProbeActive = false;
     tlsTask = nullptr;
     tlsEvidence =
-        "{\"state\":\"error\",\"error\":\"task creation failed\"}";
+        "{\"schemaVersion\":2,\"state\":\"error\",\"error\":\"task creation failed\"}";
     xSemaphoreGive(tlsMutex);
     return false;
   }
@@ -494,7 +547,8 @@ bool startTlsProbe(const char* trigger) {
 }
 
 String currentEvidence() {
-  if (!tlsMutex) return "{\"state\":\"initializing\"}";
+  if (!tlsMutex) return "{\"schemaVersion\":2,\"state\":\"initializing\"}";
+
   xSemaphoreTake(tlsMutex, portMAX_DELAY);
   const String copy = tlsEvidence;
   const bool active = tlsProbeActive;
@@ -523,21 +577,26 @@ void initializeTlsEvidenceServer() {
     tlsServer.send(200, "application/json", currentEvidence());
   });
   tlsServer.on("/healthz", HTTP_GET, [] {
-    tlsServer.send(200, "application/json", "{\"ok\":true}");
+    tlsServer.sendHeader("Cache-Control", "no-store");
+    tlsServer.send(200, "application/json",
+                   WiFi.status() == WL_CONNECTED
+                       ? "{\"ok\":true,\"wifiConnected\":true}"
+                       : "{\"ok\":false,\"wifiConnected\":false}");
   });
   tlsServer.on("/probe", HTTP_POST, [] {
     const bool mainProbeMayBeActive =
         !LittleFS.exists(kMainProbeEvidencePath) &&
         millis() < kFallbackAutoStartAfterMs;
     if (mainProbeMayBeActive) {
-      tlsServer.send(409, "application/json",
-                     "{\"error\":\"main port probe may still be active; retry after it completes\"}");
+      tlsServer.send(
+          409, "application/json",
+          "{\"error\":\"main port probe may still be active; retry after it completes\"}");
       return;
     }
 
     const bool started = startTlsProbe("manual-http");
     tlsServer.send(started ? 202 : 409, "application/json",
-                   started ? "{\"state\":\"started\"}"
+                   started ? "{\"schemaVersion\":2,\"state\":\"started\"}"
                            : "{\"error\":\"probe active or Wi-Fi disconnected\"}");
   });
   tlsServer.onNotFound([] {
@@ -562,9 +621,10 @@ void serialEventRun(void) {
     const bool mainProbeFinished = LittleFS.exists(kMainProbeEvidencePath);
     const bool fallbackDelayElapsed = millis() >= kFallbackAutoStartAfterMs;
     if (mainProbeFinished || fallbackDelayElapsed) {
-      autoProbeStarted = true;
-      startTlsProbe(mainProbeFinished ? "main-probe-complete"
-                                      : "fallback-delay-elapsed");
+      const bool started =
+          startTlsProbe(mainProbeFinished ? "main-probe-complete"
+                                          : "fallback-delay-elapsed");
+      if (started) autoProbeStarted = true;
     }
   }
 }
