@@ -18,11 +18,13 @@ No Raspberry Pi, always-on Mac, UART wiring, subnet discovery, power-cycle compa
 - Reads passive service banners when a service sends one
 - Sends `GET /` only on common plaintext HTTP ports
 - Searches returned evidence for the configured LoRa ID
-- Saves the latest result to ESP32 flash
-- Exposes a browser interface and JSON API
+- Performs a separate bounded TCP 8883 preflight before attempting TLS
+- Captures TLS version, cipher, ALPN, certificate metadata, and handshake errors when TCP 8883 is reachable
+- Saves the latest results to ESP32 flash
+- Exposes browser interfaces and JSON APIs
 - Keeps a fallback access point available for configuration
 
-It does not scan every IP on the LAN, connect to UART, write firmware, expose a shell, or probe public addresses.
+It does not scan every IP on the LAN, connect to UART, write firmware, expose a shell, authenticate to MQTT, publish, subscribe, brute force credentials, or probe public addresses.
 
 ## Default ports
 
@@ -32,12 +34,42 @@ It does not scan every IP on the LAN, connect to UART, write firmware, expose a 
 
 The list can be edited from the browser before running a probe.
 
+## TLS evidence sequencing
+
+The general port probe and the TLS evidence probe do not run concurrently.
+
+The TLS probe waits until `/rtk3-probe.json` exists, which indicates the main bounded probe completed. If the main probe cannot produce that file, the TLS probe uses a 45-second fallback delay. A manual TLS request made during that initial window returns HTTP 409 instead of competing with the main probe.
+
+Before any TLS handshake, the firmware makes three independent raw TCP connections to port 8883. The result includes:
+
+- Target source, either saved NVS configuration or compile-time default
+- ESP32 SSID, BSSID, IP, subnet mask, gateway, DNS, RSSI, and Wi-Fi channel
+- Whether the target appears to be on the ESP32 local subnet
+- Per-attempt TCP timing, errno value, errno text, and classified outcome
+- A bounded diagnosis for timeout, refusal, host routing, or subnet isolation cases
+- TLS evidence only when at least one independent TCP preflight succeeds
+
+The TLS endpoint is served separately on port 81:
+
+```text
+GET  http://<esp32-ip>:81/
+GET  http://<esp32-ip>:81/healthz
+POST http://<esp32-ip>:81/probe
+```
+
+Example:
+
+```bash
+curl http://192.168.2.43:81/
+curl -X POST http://192.168.2.43:81/probe
+```
+
 ## Build and flash from macOS
 
 ```bash
 git clone https://github.com/guy16510/mammotion-rtk3-reverse-engineering.git
 cd mammotion-rtk3-reverse-engineering
-git switch codex/esp32-s3-standalone-probe
+git switch main
 
 python3 -m pip install --user platformio
 pio test -e native
@@ -72,7 +104,7 @@ URL: http://192.168.4.1/
 8. Reconnect to your normal home Wi-Fi.
 9. Open `http://rtk3-probe.local/`.
 
-The ESP32 automatically probes the saved RTK3 after joining Wi-Fi. Select **Probe RTK3 now** to repeat it.
+The ESP32 automatically probes the saved RTK3 after joining Wi-Fi. Select **Probe RTK3 now** to repeat the general probe.
 
 You can alternatively place compile-time defaults in `include/secrets.h`:
 
@@ -83,9 +115,9 @@ You can alternatively place compile-time defaults in `include/secrets.h`:
 #define RTK3_LORA_ID "your-lora-id"
 ```
 
-Runtime values saved from the browser override compile-time defaults.
+Runtime values saved from the browser override compile-time defaults for both the general probe and the TLS evidence probe.
 
-## Result example
+## General result example
 
 ```json
 {
@@ -110,6 +142,39 @@ Runtime values saved from the browser override compile-time defaults.
 ```
 
 `loraObserved: true` is strong evidence that a returned local service exposes the configured LoRa identifier. `false` does not mean the IP is wrong. The device may not expose the identifier through an inbound plaintext service.
+
+## TLS result shape
+
+```json
+{
+  "state": "completed",
+  "targetIp": "192.168.2.26",
+  "targetSource": "nvs",
+  "port": 8883,
+  "trigger": "main-probe-complete",
+  "network": {
+    "localIp": "192.168.2.43",
+    "subnetMask": "255.255.255.0",
+    "targetOnLocalSubnet": true
+  },
+  "tcpReachable": false,
+  "tcpAttempts": [
+    {
+      "attempt": 1,
+      "connected": false,
+      "connectMs": 1501,
+      "errorCode": 116,
+      "errorText": "Connection timed out",
+      "outcome": "timeout"
+    }
+  ],
+  "tlsAttempted": false,
+  "diagnosis": "TCP 8883 was unreachable on the local subnet...",
+  "attempts": []
+}
+```
+
+When `tcpReachable` is false, an empty TLS `attempts` array is intentional. It prevents a TCP routing or isolation failure from being mislabeled as a TLS or MQTT authentication failure.
 
 ## Browser and API
 
@@ -139,12 +204,14 @@ ports=<comma-separated TCP ports>
 ## Honest limitations
 
 - The ESP32 can only inspect services the RTK3 exposes to the local network.
-- A closed port does not prove the RTK3 is offline.
+- A closed or filtered port does not prove the RTK3 is offline.
+- ICMP may be blocked even when a TCP service is available.
 - The LoRa ID may never appear in local plaintext responses.
 - A normal Wi-Fi client cannot decrypt another client's WPA-protected cloud traffic.
+- TCP timeout errno values depend on the ESP32 networking stack and should be interpreted with the timing and network snapshot, not alone.
 - If the RTK3 communicates only outbound to Mammotion cloud services, the next useful evidence source is your router, DNS logs, firewall logs, or access-point packet capture.
 - The first real run still requires your ESP32-S3, RTK3 IP, LoRa ID, and home network.
 
 ## Safety and privacy
 
-Only private IPv4 targets are accepted. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, identifiers, and service responses, so review them before publishing.
+Only private IPv4 targets are accepted by the main configuration API. Probe only equipment and networks you own or are authorized to test. Results may contain local addresses, identifiers, Wi-Fi metadata, and service responses, so review them before publishing.
