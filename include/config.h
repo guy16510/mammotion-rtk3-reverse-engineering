@@ -1,7 +1,12 @@
 #pragma once
 
-#include <stddef.h>
 #include <stdint.h>
+
+// Receive-only connection. Connect RTK TX to this pin and share GND.
+// Never connect an ESP32 TX pin to the RTK while passively probing.
+#ifndef RTK_RX_PIN
+#define RTK_RX_PIN 18
+#endif
 
 #ifndef STATUS_LED_PIN
 #define STATUS_LED_PIN -1
@@ -19,34 +24,29 @@
 #define DEVICE_HOSTNAME "rtk3-probe"
 #endif
 
-#ifndef AUTO_TARGET_PROBE_ON_BOOT
-#define AUTO_TARGET_PROBE_ON_BOOT 1
+#ifndef CAPTURE_SECONDS_PER_BAUD
+#define CAPTURE_SECONDS_PER_BAUD 12
 #endif
 
-#ifndef TARGET_PING_TIMEOUT_MS
-#define TARGET_PING_TIMEOUT_MS 700U
+#ifndef MAX_CAPTURE_SECONDS_PER_BAUD
+#define MAX_CAPTURE_SECONDS_PER_BAUD 60
 #endif
 
-#ifndef TARGET_TCP_TIMEOUT_MS
-#define TARGET_TCP_TIMEOUT_MS 800U
-#endif
-
-#ifndef TARGET_BANNER_WAIT_MS
-#define TARGET_BANNER_WAIT_MS 500U
-#endif
-
-#ifndef MAX_BANNER_BYTES
-#define MAX_BANNER_BYTES 768U
+// Eight baud samples at 64 KiB each fit comfortably in the default LittleFS
+// partition. Increase only after selecting a larger filesystem partition or SD.
+#ifndef MAX_CAPTURE_BYTES_PER_BAUD
+#define MAX_CAPTURE_BYTES_PER_BAUD (64U * 1024U)
 #endif
 
 #ifndef MAX_PROBE_PORTS
-#define MAX_PROBE_PORTS 24U
+#define MAX_PROBE_PORTS 16
 #endif
 
-// Direct checks for the known RTK3. These cover common embedded web, MQTT,
-// NTRIP/GNSS, discovery, diagnostics, and Mammotion-adjacent service ranges.
-static constexpr uint16_t DEFAULT_TARGET_PORTS[] = {
-    22, 53, 80, 443, 554, 123, 1883, 2101, 5000, 5001, 5353, 8000,
-    8080, 8443, 8883, 9000, 10000, 50001, 50002, 50003};
-static constexpr size_t DEFAULT_TARGET_PORT_COUNT =
-    sizeof(DEFAULT_TARGET_PORTS) / sizeof(DEFAULT_TARGET_PORTS[0]);
+#ifndef TCP_CONNECT_TIMEOUT_MS
+#define TCP_CONNECT_TIMEOUT_MS 500
+#endif
+
+static constexpr uint32_t RTK_BAUD_RATES[] = {
+    9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+static constexpr size_t RTK_BAUD_RATE_COUNT =
+    sizeof(RTK_BAUD_RATES) / sizeof(RTK_BAUD_RATES[0]);
