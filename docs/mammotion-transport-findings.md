@@ -71,3 +71,10 @@ streams whose timing correlates with GNSS lock or the robot's RTK state.
 Success still requires payload validation: repeatable CRC-24Q-valid RTCM3
 frames with plausible types, station ID, rate, and freshness, or equivalent
 validation of a different correction format.
+
+The repository's `scripts/pcap_transport_report.py` automates these checks for
+classic Ethernet libpcap captures. It reports observed ARP IP/MAC pairs, target
+flows, DNS, TLS SNI, directional payload sizes and timing, and CRC-valid RTCM3
+found in visible payloads. Its `--require-rtcm` flag provides a nonzero
+acceptance gate. It intentionally does not decrypt TLS or infer corrections
+from encrypted MQTT.

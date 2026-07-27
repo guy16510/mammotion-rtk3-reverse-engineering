@@ -1,6 +1,6 @@
 # RTK3 robot correction status
 
-Last updated: 2026-07-27 11:55 EDT
+Last updated: 2026-07-27 12:15 EDT
 
 ## Confirmed facts
 
@@ -27,6 +27,9 @@ Last updated: 2026-07-27 11:55 EDT
   in.
 - No Mammotion/Luba/Yuka application package, mobile backup, configuration, or
   relevant log was found in the local Mac paths searched.
+- The Mac can enumerate `en0` as the associated Wi-Fi interface, but the
+  current user cannot open `/dev/bpf0`; a local packet capture therefore needs
+  administrator authorization or a router/mirrored capture.
 
 ## Disproven assumptions
 
@@ -66,6 +69,8 @@ Wi-Fi LAN 192.168.2.0/24
   `49f1ed0797a18770e1c8d9ef76c89f632a50e4bd`.
 - Tested batch SSH access to `192.168.2.15` with four likely usernames.
 - Inspected the TP-Link Deco UI in both available browser contexts.
+- Attempted a target-filtered `tcpdump` on `en0`; it stopped before capture
+  with `/dev/bpf0: Permission denied`.
 - Restored `src/main.cpp`, `include/config.h`, and `platformio.ini` from the
   passive UART implementation, then repaired the current native-test layout.
 - Built and flashed with:
@@ -147,6 +152,15 @@ Wi-Fi LAN 192.168.2.0/24
   RTK3 TX -> ESP32 GPIO18 -> raw TCP 2101
           -> host CRC-validating relay -> robot receiver serial
   ```
+- Added `scripts/pcap_transport_report.py`, a dependency-free, read-only
+  analyzer for classic Ethernet libpcap captures. It:
+  - proves observed IP/MAC relationships from ARP before interpreting flows;
+  - filters by repeatable target IP and MAC arguments;
+  - reports TCP/UDP endpoints, direction, byte counts, and timing;
+  - decodes UDP DNS and complete single-segment TLS ClientHello SNI;
+  - scans visible flow payloads with the same CRC-validating RTCM3 parser;
+  - offers `--require-rtcm`, which exits 2 when no valid frame is present;
+  - explicitly does not decrypt TLS or classify encrypted MQTT as corrections.
 
 ## Tests and hardware results
 
@@ -155,9 +169,10 @@ Wi-Fi LAN 192.168.2.0/24
 - ESP32 flash: passed; image hash verified by esptool.
 - ESP32 ping and `GET /api/status`: passed at `192.168.2.35`.
 - Full eight-baud capture state machine: passed.
-- Host tests: 13/13 passed, including chunk boundaries, corruption recovery,
+- Host tests: 16/16 passed, including chunk boundaries, corruption recovery,
   strict header validation, station-ID interpretation, valid-only extraction,
-  byte-exact relay, and an empty-stream stale-state regression.
+  byte-exact relay, an empty-stream stale-state regression, pcap ARP identity,
+  DNS, TLS SNI, target filtering, and RTCM-in-flow detection.
 - The real one-byte unwired GPIO18 capture was passed through
   `rtcm_pipeline.py analyze --require-frames`; it reported one discarded byte,
   zero valid frames, `stale: true`, and exited 2 as required.

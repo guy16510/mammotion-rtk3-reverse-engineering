@@ -111,6 +111,25 @@ The ESP32 TCP stream is intentionally raw so both RTCM and any newly discovered
 protocol remain observable. The host relay is the validation boundary: it
 never forwards noise, truncated candidates, or CRC-invalid frames.
 
+## Analyze an outbound packet capture
+
+Capture in classic pcap format (`tcpdump -w` does this by default), then report
+ARP identity, RTK3 flows, DNS, TLS SNI, timing, byte direction, and any
+CRC-valid RTCM3 visible in unencrypted packet payloads:
+
+```sh
+sudo tcpdump -i en0 -s 0 -w rtk3-outbound.pcap \
+  'host 192.168.2.26 or ether host c0:f5:35:cf:70:11'
+
+python3 scripts/pcap_transport_report.py rtk3-outbound.pcap \
+  --target-ip 192.168.2.26 \
+  --target-mac C0:F5:35:CF:70:11
+```
+
+Use `--require-rtcm` as an acceptance gate; it exits 2 when the capture has no
+CRC-valid RTCM3. The report never treats encrypted MQTT as proof of correction
+delivery. The tool accepts classic Ethernet libpcap, not pcapng.
+
 ## Evidence threshold
 
 Random bytes or a `0xD3` preamble are not correction evidence. A useful
