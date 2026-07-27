@@ -1,6 +1,6 @@
 # RTK3 robot correction status
 
-Last updated: 2026-07-27 11:25 EDT
+Last updated: 2026-07-27 11:35 EDT
 
 ## Confirmed facts
 
@@ -114,6 +114,18 @@ Wi-Fi LAN 192.168.2.0/24
     forwarded frame/byte counts;
   - accepts file, TCP, or serial input and file, TCP, or serial output;
   - provides nonzero acceptance-gate exits for missing frames or CRC errors.
+- Added a fixed-baud receive-only live mode to the ESP32:
+  - `POST /api/stream/start?baud=<rate>` selects one supported baud;
+  - raw GPIO18 input is served to one TCP client on port 2101;
+  - the status API reports client, byte, RTCM frame, CRC, and type counters;
+  - live mode and baud-sweep capture are mutually exclusive;
+  - no UART transmit pin is enabled.
+- The intended live path is now:
+
+  ```text
+  RTK3 TX -> ESP32 GPIO18 -> raw TCP 2101
+          -> host CRC-validating relay -> robot receiver serial
+  ```
 
 ## Tests and hardware results
 
@@ -128,6 +140,14 @@ Wi-Fi LAN 192.168.2.0/24
 - The real one-byte unwired GPIO18 capture was passed through
   `rtcm_pipeline.py analyze --require-frames`; it reported one discarded byte,
   zero valid frames, `stale: true`, and exited 2 as required.
+- Live TCP firmware test on physical ESP32 passed:
+  - unsupported baud `12345` was rejected;
+  - 115200-baud live mode started;
+  - a Mac TCP client connected to port 2101 and appeared in status;
+  - capture start during live mode was rejected with HTTP 409;
+  - stream stop closed the client and returned to inactive state.
+- The unwired live-stream negative control reported zero bytes and zero RTCM
+  frames, as expected.
 - RTCM3 acquisition: not yet passed because the capture input is unwired.
 - Robot correction consumption and RTK FLOAT/FIX: not yet tested.
 

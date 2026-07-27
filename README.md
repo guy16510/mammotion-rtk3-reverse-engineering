@@ -25,6 +25,8 @@ identified. Never connect ESP32 TX, 3.3 V, or 5 V while passively probing.
 - Validates RTCM3 frames with CRC-24Q
 - Reports RTCM message types, CRC errors, UBX sync markers, NMEA prefixes, and
   printable-byte ratio
+- Exposes a fixed-baud, receive-only raw TCP stream on port 2101 after a baud
+  has been selected explicitly
 - Provides HTTP controls for capture, downloads, Wi-Fi/BLE discovery, and a
   bounded private-address TCP probe
 - Configures no UART transmit pin
@@ -64,6 +66,8 @@ Other endpoints:
 
 ```text
 POST /api/capture/stop
+POST /api/stream/start?baud=<supported-baud>
+POST /api/stream/stop
 POST /api/wifi/scan
 POST /api/ble/scan
 POST /api/probe?ip=<private-ip>&ports=<comma-separated-ports>
@@ -97,11 +101,13 @@ File and TCP stream endpoints are also supported:
 
 ```sh
 python3 scripts/rtcm_pipeline.py relay \
-  --input-tcp 192.168.2.10:2101 \
-  --output-tcp 192.168.2.11:2101
+  --input-tcp 192.168.2.35:2101 \
+  --output-serial /dev/cu.usbserial-ROBOT --output-baud 115200
 ```
 
-The relay never forwards noise, truncated candidates, or CRC-invalid frames.
+The ESP32 TCP stream is intentionally raw so both RTCM and any newly discovered
+protocol remain observable. The host relay is the validation boundary: it
+never forwards noise, truncated candidates, or CRC-invalid frames.
 
 ## Evidence threshold
 

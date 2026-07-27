@@ -22,6 +22,8 @@ namespace {
 
 HardwareSerial RtkSerial(1);
 WebServer server(80);
+WiFiServer correctionServer(2101);
+WiFiClient correctionClient;
 ProtocolAnalyzer analyzer;
 
 struct BaudResult {
@@ -40,6 +42,15 @@ struct CaptureState {
   File output;
   std::array<BaudResult, RTK_BAUD_RATE_COUNT> results{};
 } capture;
+
+struct StreamState {
+  bool active = false;
+  uint32_t baud = 0;
+  uint64_t bytesRead = 0;
+  uint64_t bytesSent = 0;
+  uint32_t clientsAccepted = 0;
+  uint32_t startedMs = 0;
+} stream;
 
 String jsonEscape(const String& value) {
   String out;
@@ -61,6 +72,11 @@ String jsonEscape(const String& value) {
 }
 
 String baudPath(uint32_t baud) { return "/baud-" + String(baud) + ".bin"; }
+
+bool supportedBaud(uint32_t baud) {
+  return std::find(std::begin(RTK_BAUD_RATES), std::end(RTK_BAUD_RATES), baud) !=
+         std::end(RTK_BAUD_RATES);
+}
 
 void setLed(bool on) {
   if (STATUS_LED_PIN >= 0) digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
@@ -168,7 +184,7 @@ void finishCapture() {
 }
 
 bool startCapture(uint32_t secondsPerBaud) {
-  if (capture.active) return false;
+  if (capture.active || stream.active) return false;
   clearCaptureFiles();
   capture = CaptureState{};
   capture.active = true;
@@ -221,6 +237,63 @@ void serviceCapture() {
   }
 }
 
+void stopLiveStream() {
+  if (!stream.active) return;
+  RtkSerial.end();
+  correctionClient.stop();
+  stream.active = false;
+  setLed(false);
+  Serial.println("[stream] stopped");
+}
+
+bool startLiveStream(uint32_t baud) {
+  if (capture.active || stream.active || !supportedBaud(baud)) return false;
+  stream = StreamState{};
+  stream.active = true;
+  stream.baud = baud;
+  stream.startedMs = millis();
+  analyzer.reset();
+  pinMode(RTK_RX_PIN, INPUT);
+  RtkSerial.begin(baud, SERIAL_8N1, RTK_RX_PIN, -1);
+  setLed(true);
+  Serial.printf("[stream] receive-only TCP bridge baud=%lu port=2101\n",
+                static_cast<unsigned long>(baud));
+  return true;
+}
+
+void serviceLiveStream() {
+  if (!stream.active) return;
+
+  if (!correctionClient || !correctionClient.connected()) {
+    correctionClient.stop();
+    WiFiClient candidate = correctionServer.available();
+    if (candidate) {
+      correctionClient = candidate;
+      correctionClient.setNoDelay(true);
+      ++stream.clientsAccepted;
+      Serial.printf("[stream] client connected from %s\n",
+                    correctionClient.remoteIP().toString().c_str());
+    }
+  }
+
+  uint8_t buffer[512];
+  while (RtkSerial.available() > 0) {
+    const size_t wanted = std::min<size_t>(RtkSerial.available(), sizeof(buffer));
+    const size_t received = RtkSerial.readBytes(buffer, wanted);
+    if (!received) break;
+    stream.bytesRead += received;
+    analyzer.feed(buffer, received);
+    if (correctionClient && correctionClient.connected()) {
+      const size_t sent = correctionClient.write(buffer, received);
+      stream.bytesSent += sent;
+      if (sent != received) {
+        correctionClient.stop();
+        Serial.println("[stream] short TCP write, client dropped");
+      }
+    }
+  }
+}
+
 String statusJson() {
   String json = "{\"ok\":true";
   json += ",\"hostname\":\"" + jsonEscape(DEVICE_HOSTNAME) + "\"";
@@ -233,6 +306,19 @@ String statusJson() {
     const uint32_t elapsed = (millis() - capture.sampleStartedMs) / 1000UL;
     json += ",\"sampleElapsedSeconds\":" + String(elapsed);
   }
+  json += ",\"streamActive\":" + String(stream.active ? "true" : "false");
+  json += ",\"streamPort\":2101";
+  json += ",\"streamBaud\":" + String(stream.baud);
+  json += ",\"streamClientConnected\":" +
+          String(correctionClient && correctionClient.connected() ? "true" : "false");
+  json += ",\"streamClientsAccepted\":" + String(stream.clientsAccepted);
+  json += ",\"streamBytesRead\":" +
+          String(static_cast<unsigned long long>(stream.bytesRead));
+  json += ",\"streamBytesSent\":" +
+          String(static_cast<unsigned long long>(stream.bytesSent));
+  json += ",\"streamRtcmFrames\":" + String(analyzer.stats().rtcmFrames);
+  json += ",\"streamRtcmCrcErrors\":" + String(analyzer.stats().rtcmCrcErrors);
+  json += ",\"streamRtcmTypes\":" + typesJson(analyzer.stats());
   json += ",\"stationConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   json += ",\"stationIp\":\"" + WiFi.localIP().toString() + "\"";
   json += ",\"apIp\":\"" + WiFi.softAPIP().toString() + "\"";
@@ -253,7 +339,24 @@ void handleStartCapture() {
                                ? static_cast<uint32_t>(server.arg("seconds").toInt())
                                : CAPTURE_SECONDS_PER_BAUD;
   if (!startCapture(seconds)) {
-    sendJson(409, "{\"error\":\"capture already active\"}");
+    sendJson(409, "{\"error\":\"capture or live stream already active\"}");
+    return;
+  }
+  sendJson(202, statusJson());
+}
+
+void handleStartLiveStream() {
+  if (!server.hasArg("baud")) {
+    sendJson(400, "{\"error\":\"baud is required\"}");
+    return;
+  }
+  const uint32_t baud = static_cast<uint32_t>(server.arg("baud").toInt());
+  if (!supportedBaud(baud)) {
+    sendJson(400, "{\"error\":\"unsupported baud\"}");
+    return;
+  }
+  if (!startLiveStream(baud)) {
+    sendJson(409, "{\"error\":\"capture or live stream already active\"}");
     return;
   }
   sendJson(202, statusJson());
@@ -397,6 +500,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 body{font-family:system-ui;margin:2rem;max-width:900px;background:#111;color:#eee}button,input{font:inherit;padding:.6rem;margin:.25rem}button{cursor:pointer}pre{background:#222;padding:1rem;overflow:auto;white-space:pre-wrap}.row{display:flex;gap:.5rem;flex-wrap:wrap}.card{border:1px solid #444;padding:1rem;margin:1rem 0;border-radius:.5rem}a{color:#8cf}
 </style></head><body><h1>RTK3 ESP32-S3 Probe</h1>
 <div class="card"><h2>Passive UART sweep</h2><div class="row"><input id="seconds" type="number" min="1" max="60" value="12"><button onclick="post('/api/capture/start?seconds='+seconds.value)">Start</button><button onclick="post('/api/capture/stop')">Stop</button><button onclick="get('/api/summary')">Summary</button><button onclick="get('/api/files')">Files</button></div></div>
+<div class="card"><h2>Fixed-baud live stream</h2><div class="row"><input id="streamBaud" type="number" value="115200"><button onclick="post('/api/stream/start?baud='+streamBaud.value)">Start TCP 2101</button><button onclick="post('/api/stream/stop')">Stop</button></div><p>Choose a baud only after the passive sweep identifies a valid signal. The stream is raw and must pass through the host CRC validator before reaching a receiver.</p></div>
 <div class="card"><h2>Radio discovery</h2><button onclick="post('/api/wifi/scan')">Wi-Fi scan</button><button onclick="post('/api/ble/scan')">BLE scan</button></div>
 <div class="card"><h2>Bounded private-network probe</h2><input id="ip" placeholder="192.168.1.123"><input id="ports" value="80,443,1883,8883"><button onclick="post('/api/probe?ip='+encodeURIComponent(ip.value)+'&ports='+encodeURIComponent(ports.value))">Probe</button></div>
 <pre id="out">Loading status...</pre><script>
@@ -411,6 +515,11 @@ void configureRoutes() {
   server.on("/api/capture/start", HTTP_POST, handleStartCapture);
   server.on("/api/capture/stop", HTTP_POST, [] {
     stopCapture();
+    sendJson(200, statusJson());
+  });
+  server.on("/api/stream/start", HTTP_POST, handleStartLiveStream);
+  server.on("/api/stream/stop", HTTP_POST, [] {
+    stopLiveStream();
     sendJson(200, statusJson());
   });
   server.on("/api/summary", HTTP_GET, handleSummary);
@@ -462,11 +571,14 @@ void setup() {
   NimBLEDevice::init(DEVICE_HOSTNAME);
   configureRoutes();
   server.begin();
-  Serial.println("[http] server ready");
+  correctionServer.begin();
+  correctionServer.setNoDelay(true);
+  Serial.println("[http] server ready; raw correction stream port 2101 ready");
 }
 
 void loop() {
   server.handleClient();
   serviceCapture();
+  serviceLiveStream();
   delay(1);
 }
