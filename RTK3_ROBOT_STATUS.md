@@ -1,6 +1,6 @@
 # RTK3 robot correction status
 
-Last updated: 2026-07-27 11:35 EDT
+Last updated: 2026-07-27 11:55 EDT
 
 ## Confirmed facts
 
@@ -25,6 +25,8 @@ Last updated: 2026-07-27 11:35 EDT
 - The gateway at `192.168.2.1` is a TP-Link Deco. Its local UI is reachable but
   requires the owner password; no existing in-app or Chrome session is logged
   in.
+- No Mammotion/Luba/Yuka application package, mobile backup, configuration, or
+  relevant log was found in the local Mac paths searched.
 
 ## Disproven assumptions
 
@@ -58,6 +60,10 @@ Wi-Fi LAN 192.168.2.0/24
 - Inspected removed capture code and the UART firmware at commit `fa6fc62`.
 - Enumerated serial devices, interfaces, routes, ARP, DNS, SSH host keys, and
   locally available PCAPs.
+- Searched local application, backup, and indexed-file locations for Mammotion
+  Android/iOS packages, configuration, and logs.
+- Inspected public PyMammotion source at exact commit
+  `49f1ed0797a18770e1c8d9ef76c89f632a50e4bd`.
 - Tested batch SSH access to `192.168.2.15` with four likely usernames.
 - Inspected the TP-Link Deco UI in both available browser contexts.
 - Restored `src/main.cpp`, `include/config.h`, and `platformio.ini` from the
@@ -93,6 +99,21 @@ Wi-Fi LAN 192.168.2.0/24
   corrupted frame.
 - No valid RTK3-originated correction frame has yet been acquired, so the
   correction transport, message set, station ID, and rates remain unknown.
+- Public protobuf definitions explicitly model RTK3 base-station LoRa state,
+  MQTT RTK state, and a configurable RTK URL, port, username, and password.
+  Mower telemetry distinguishes LoRa, Internet, and NRTK modes and includes
+  correction age and quality fields.
+- The public Mammotion cloud implementation uses MQTT device event/status
+  topics and, for the older transport, an Aliyun hostname convention. No
+  inspected public message has an obvious raw-correction payload field.
+- Therefore LoRa or an internal serial link is the strongest current
+  correction-path hypothesis. The cloud path is currently evidence for
+  telemetry/control, not proof of raw RTCM delivery.
+- The endpoint fields' direction and exact semantics are unresolved; they
+  cannot yet be called an NTRIP caster output.
+- `docs/mammotion-transport-findings.md` records source permalinks, the
+  evidence/inference boundary, and a capture checklist for DHCP/ARP identity,
+  DNS, TLS SNI, destinations, ports, sizes, and event-correlated timing.
 
 ## Code implemented
 

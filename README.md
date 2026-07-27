@@ -4,6 +4,8 @@ This repository is working toward extracting GNSS corrections from a Mammotion
 RTK3 and delivering them to a robot receiver. The current hardware path is a
 receive-only ESP32-S3 UART capture probe. See `RTK3_ROBOT_STATUS.md` for the
 authoritative evidence, current blocker, and remaining acceptance criteria.
+Public-source clues and a network-capture checklist are in
+`docs/mammotion-transport-findings.md`.
 
 ## Safety
 
