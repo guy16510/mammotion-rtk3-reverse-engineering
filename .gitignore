@@ -5,6 +5,8 @@ include/secrets.h
 *.elf
 *.map
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Local environment and credential files
 .env

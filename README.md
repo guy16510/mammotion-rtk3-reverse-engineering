@@ -69,6 +69,40 @@ POST /api/ble/scan
 POST /api/probe?ip=<private-ip>&ports=<comma-separated-ports>
 ```
 
+## Validate and relay corrections
+
+Analyze a capture, extract only valid RTCM3 frames, and fail if none exist:
+
+```sh
+python3 scripts/rtcm_pipeline.py analyze baud-115200.bin \
+  --extract valid.rtcm3 \
+  --require-frames
+```
+
+Use `--reject-crc-errors` when the source is expected to contain only clean
+RTCM3. The JSON report includes input/discarded bytes, CRC failures, frame and
+byte counts, message-type counts, reference-station IDs, correction age,
+frame rate, and stale state.
+
+Relay only validated frames to a robot receiver:
+
+```sh
+python3 -m pip install pyserial
+python3 scripts/rtcm_pipeline.py relay \
+  --input-serial /dev/cu.usbserial-RTK3 --input-baud 115200 \
+  --output-serial /dev/cu.usbserial-ROBOT --output-baud 115200
+```
+
+File and TCP stream endpoints are also supported:
+
+```sh
+python3 scripts/rtcm_pipeline.py relay \
+  --input-tcp 192.168.2.10:2101 \
+  --output-tcp 192.168.2.11:2101
+```
+
+The relay never forwards noise, truncated candidates, or CRC-invalid frames.
+
 ## Evidence threshold
 
 Random bytes or a `0xD3` preamble are not correction evidence. A useful

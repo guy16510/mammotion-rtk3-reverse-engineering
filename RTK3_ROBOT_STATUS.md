@@ -1,6 +1,6 @@
 # RTK3 robot correction status
 
-Last updated: 2026-07-27 11:10 EDT
+Last updated: 2026-07-27 11:25 EDT
 
 ## Confirmed facts
 
@@ -104,6 +104,16 @@ Wi-Fi LAN 192.168.2.0/24
 - GPIO18 is the only RTK-side signal input; no ESP32 TX pin is configured.
 - New captures remove stale inbound LAN/TLS result files so they cannot be
   confused with current acquisition evidence.
+- Added `scripts/rtcm_pipeline.py`, a host-side incremental RTCM3 pipeline
+  which:
+  - extracts and relays only complete CRC-24Q-valid frames;
+  - recovers from arbitrary noise, bad reserved header bits, and corrupt CRCs;
+  - reports message types and reference-station IDs without mislabeling
+    satellite ephemeris payload fields;
+  - reports frame rate, correction age, stale state, discarded data, and
+    forwarded frame/byte counts;
+  - accepts file, TCP, or serial input and file, TCP, or serial output;
+  - provides nonzero acceptance-gate exits for missing frames or CRC errors.
 
 ## Tests and hardware results
 
@@ -112,6 +122,12 @@ Wi-Fi LAN 192.168.2.0/24
 - ESP32 flash: passed; image hash verified by esptool.
 - ESP32 ping and `GET /api/status`: passed at `192.168.2.35`.
 - Full eight-baud capture state machine: passed.
+- Host tests: 13/13 passed, including chunk boundaries, corruption recovery,
+  strict header validation, station-ID interpretation, valid-only extraction,
+  byte-exact relay, and an empty-stream stale-state regression.
+- The real one-byte unwired GPIO18 capture was passed through
+  `rtcm_pipeline.py analyze --require-frames`; it reported one discarded byte,
+  zero valid frames, `stale: true`, and exited 2 as required.
 - RTCM3 acquisition: not yet passed because the capture input is unwired.
 - Robot correction consumption and RTK FLOAT/FIX: not yet tested.
 
@@ -127,7 +143,8 @@ path remains the higher-priority next step.
 Once clear internal photos identify board labels and connectors, select the
 most likely GNSS-to-controller TX line, specify a receive-only 3.3 V-safe tap,
 run longer baud sweeps, download the winning raw stream, validate RTCM CRC/type
-and station ID, then implement live forwarding from the confirmed stream.
+and station ID with the host pipeline, then connect its validated serial relay
+to the robot receiver.
 
 ## Single physical action needed from the user
 
